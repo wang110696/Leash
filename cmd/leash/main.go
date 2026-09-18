@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 	"github.com/wang110696/Leash/internal/gitremote"
 	"github.com/wang110696/Leash/internal/gitshim"
 	"github.com/wang110696/Leash/internal/policy"
+	"github.com/wang110696/Leash/internal/procwatch"
 	"github.com/wang110696/Leash/internal/proxy"
 	"github.com/wang110696/Leash/internal/store"
 )
@@ -164,12 +166,25 @@ func runSession(command []string) (int, error) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	runErr := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("run %s: %w", command[0], err)
+	}
+
+	// Runtime Sensor · Process Plane (v0.2, ARCHITECTURE.md 10.1): best-effort,
+	// record-only process-tree observation, attributed to the session by
+	// ancestry from the agent's own PID. Needs the PID while the process is
+	// still running, hence cmd.Start()+Wait() instead of cmd.Run().
+	obsCtx, stopObserving := context.WithCancel(context.Background())
+	observer := procwatch.New(sessionID, cmd.Process.Pid, st)
+	go observer.Run(obsCtx)
+
+	runErr := cmd.Wait()
+	stopObserving()
 
 	summary, sumErr := st.Summary(sessionID)
 	if sumErr == nil {
-		fmt.Fprintf(os.Stderr, "leash: session %s ended — allow=%d warn=%d block=%d\n",
-			sessionID, summary.Allow, summary.Warn, summary.Block)
+		fmt.Fprintf(os.Stderr, "leash: session %s ended — allow=%d warn=%d block=%d, processes observed=%d\n",
+			sessionID, summary.Allow, summary.Warn, summary.Block, summary.ProcessesObserved)
 	}
 
 	if runErr != nil {

@@ -63,13 +63,20 @@ const (
 )
 
 // Summary reports how many events of each decision were recorded for a
-// session — used for the end-of-session CLI banner.
+// session — used for the end-of-session CLI banner. ProcessesObserved is
+// counted separately from Allow: process_exec events (Runtime Sensor ·
+// Process Plane, v0.2) are record-only informational events, not
+// allow/block decisions about a security-sensitive action, and mixing
+// them into Allow would make that count misleading.
 type Summary struct {
 	Allow, Warn, Block int
+	ProcessesObserved  int
 }
 
 func (s *Store) Summary(sessionID string) (Summary, error) {
-	rows, err := s.db.Query(`SELECT decision, COUNT(*) FROM events WHERE session_id = ? GROUP BY decision`, sessionID)
+	rows, err := s.db.Query(
+		`SELECT decision, kind, COUNT(*) FROM events WHERE session_id = ? GROUP BY decision, kind`,
+		sessionID)
 	if err != nil {
 		return Summary{}, err
 	}
@@ -77,18 +84,22 @@ func (s *Store) Summary(sessionID string) (Summary, error) {
 
 	var sum Summary
 	for rows.Next() {
-		var decision string
+		var decision, kind string
 		var n int
-		if err := rows.Scan(&decision, &n); err != nil {
+		if err := rows.Scan(&decision, &kind, &n); err != nil {
 			return Summary{}, err
+		}
+		if kind == "process_exec" {
+			sum.ProcessesObserved += n
+			continue
 		}
 		switch Decision(decision) {
 		case Allow:
-			sum.Allow = n
+			sum.Allow += n
 		case Warn:
-			sum.Warn = n
+			sum.Warn += n
 		case Block:
-			sum.Block = n
+			sum.Block += n
 		}
 	}
 	return sum, rows.Err()
