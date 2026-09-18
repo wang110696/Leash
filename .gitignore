@@ -1,0 +1,12 @@
+# Build output
+/leash
+*.exe
+*.test
+
+# Runtime data (local CA, event database, session state) — never commit this
+.leash/
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
