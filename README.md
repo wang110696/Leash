@@ -8,6 +8,7 @@ Know what your coding agent sent, and where it tried to push your code — befor
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/wang110696/Leash/actions/workflows/ci.yml/badge.svg)](https://github.com/wang110696/Leash/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go)](go.mod)
 [![Status](https://img.shields.io/badge/status-v0.1%20alpha-orange)](ARCHITECTURE.md)
