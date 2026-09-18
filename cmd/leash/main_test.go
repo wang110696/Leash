@@ -39,7 +39,7 @@ func TestBuildChildEnv_ScrubsProxyBypass(t *testing.T) {
 	os.Setenv("PATH", "/usr/bin:/bin")
 
 	env := buildChildEnv("sess1", "/tmp/sessdir", "/tmp/events.db", "/usr/bin/git",
-		"127.0.0.1:12345", "/tmp/ca.pem", "/tmp/shimbin")
+		"127.0.0.1:12345", "/tmp/ca.pem", "/tmp/shimbin", "/tmp/sessdir/git-hooks")
 	m := envMap(env)
 
 	if v, ok := m["NO_PROXY"]; !ok || v != "" {
@@ -62,6 +62,42 @@ func TestBuildChildEnv_ScrubsProxyBypass(t *testing.T) {
 	if !strings.HasPrefix(m["PATH"], "/tmp/shimbin") {
 		t.Errorf("PATH = %q; want shim dir prepended", m["PATH"])
 	}
+
+	if got := m["NODE_EXTRA_CA_CERTS"]; got != "/tmp/ca.pem" {
+		t.Errorf("NODE_EXTRA_CA_CERTS = %q; want the CA path (Claude Code harness support)", got)
+	}
+}
+
+func TestAppendGitConfigOverride(t *testing.T) {
+	t.Run("no prior GIT_CONFIG_COUNT", func(t *testing.T) {
+		env := appendGitConfigOverride([]string{"PATH=/bin"}, "core.hooksPath", "/tmp/hooks")
+		m := envMap(env)
+		if m["GIT_CONFIG_COUNT"] != "1" {
+			t.Fatalf("GIT_CONFIG_COUNT = %q; want 1", m["GIT_CONFIG_COUNT"])
+		}
+		if m["GIT_CONFIG_KEY_0"] != "core.hooksPath" || m["GIT_CONFIG_VALUE_0"] != "/tmp/hooks" {
+			t.Fatalf("GIT_CONFIG_KEY_0/VALUE_0 = %q/%q; want core.hooksPath//tmp/hooks", m["GIT_CONFIG_KEY_0"], m["GIT_CONFIG_VALUE_0"])
+		}
+	})
+
+	t.Run("appends after an existing override instead of clobbering it", func(t *testing.T) {
+		env := []string{
+			"GIT_CONFIG_COUNT=1",
+			"GIT_CONFIG_KEY_0=user.name",
+			"GIT_CONFIG_VALUE_0=someone",
+		}
+		env = appendGitConfigOverride(env, "core.hooksPath", "/tmp/hooks")
+		m := envMap(env)
+		if m["GIT_CONFIG_COUNT"] != "2" {
+			t.Fatalf("GIT_CONFIG_COUNT = %q; want 2", m["GIT_CONFIG_COUNT"])
+		}
+		if m["GIT_CONFIG_KEY_0"] != "user.name" || m["GIT_CONFIG_VALUE_0"] != "someone" {
+			t.Fatalf("existing override at index 0 was clobbered: %q=%q", m["GIT_CONFIG_KEY_0"], m["GIT_CONFIG_VALUE_0"])
+		}
+		if m["GIT_CONFIG_KEY_1"] != "core.hooksPath" || m["GIT_CONFIG_VALUE_1"] != "/tmp/hooks" {
+			t.Fatalf("new override not appended at index 1: %q=%q", m["GIT_CONFIG_KEY_1"], m["GIT_CONFIG_VALUE_1"])
+		}
+	})
 }
 
 // TestLookPathIn_ReturnsAbsolutePath is a regression test for E6: a

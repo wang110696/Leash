@@ -10,19 +10,28 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/wang110696/Leash/internal"
 	"github.com/wang110696/Leash/internal/ca"
 	"github.com/wang110696/Leash/internal/gitremote"
 	"github.com/wang110696/Leash/internal/gitshim"
+	"github.com/wang110696/Leash/internal/policy"
 	"github.com/wang110696/Leash/internal/proxy"
 	"github.com/wang110696/Leash/internal/store"
 )
 
 func main() {
-	if filepath.Base(os.Args[0]) == "git" {
+	switch filepath.Base(os.Args[0]) {
+	case "git":
 		os.Exit(gitshim.Run(os.Args[1:]))
+	case "pre-push":
+		os.Exit(gitshim.RunPrePushHook(os.Args[1:], os.Stdin))
+	}
+
+	if len(os.Args) >= 2 && os.Args[1] == "doctor" {
+		os.Exit(runDoctor())
 	}
 
 	if len(os.Args) < 2 || os.Args[1] != "run" {
@@ -76,6 +85,13 @@ func runSession(command []string) (int, error) {
 		return 0, fmt.Errorf("ensure local CA: %w", err)
 	}
 
+	// A missing policy.yaml is not an error — policy.Load falls back to
+	// policy.Default(), which reproduces v0.1's fixed behavior exactly.
+	cfg, err := policy.Load(filepath.Join(leashDir, "policy.yaml"))
+	if err != nil {
+		return 0, fmt.Errorf("load policy: %w", err)
+	}
+
 	dbPath := filepath.Join(leashDir, "events.db")
 	st, err := store.Open(dbPath)
 	if err != nil {
@@ -83,7 +99,7 @@ func runSession(command []string) (int, error) {
 	}
 	defer st.Close()
 
-	px, err := proxy.New(sessionID, st, certPEM, keyPEM)
+	px, err := proxy.New(sessionID, st, certPEM, keyPEM, cfg)
 	if err != nil {
 		return 0, fmt.Errorf("start proxy: %w", err)
 	}
@@ -108,6 +124,18 @@ func runSession(command []string) (int, error) {
 		return 0, fmt.Errorf("install session-scoped git shim: %w", err)
 	}
 
+	// Defense-in-depth pre-push hook (ARCHITECTURE.md 4.5): catches a push
+	// via the real git binary invoked by absolute path, which bypasses the
+	// PATH-based shim above. Installed as a session-scoped GIT_CONFIG_*
+	// override in buildChildEnv, not by touching ~/.gitconfig.
+	hooksDir := filepath.Join(sessionDir, "git-hooks")
+	if err := os.MkdirAll(hooksDir, 0o700); err != nil {
+		return 0, fmt.Errorf("create session git-hooks dir: %w", err)
+	}
+	if err := os.Symlink(self, filepath.Join(hooksDir, "pre-push")); err != nil {
+		return 0, fmt.Errorf("install session-scoped pre-push hook: %w", err)
+	}
+
 	remotes := snapshotKnownRemotes(realGit, cwd)
 	if err := internal.SaveKnownRemotes(sessionDir, remotes); err != nil {
 		return 0, fmt.Errorf("save known-remotes snapshot: %w", err)
@@ -116,7 +144,7 @@ func runSession(command []string) (int, error) {
 	fmt.Fprintf(os.Stderr, "leash: session %s started, proxy on %s, known remotes: %v\n",
 		sessionID, px.Addr(), remotes)
 
-	childEnv := buildChildEnv(sessionID, sessionDir, dbPath, realGit, px.Addr(), caPaths.CertPath, shimBinDir)
+	childEnv := buildChildEnv(sessionID, sessionDir, dbPath, realGit, px.Addr(), caPaths.CertPath, shimBinDir, hooksDir)
 
 	// exec.Command resolves a bare command name via the *calling* process's
 	// PATH, not cmd.Env's — so if we passed command[0] straight through,
@@ -151,6 +179,38 @@ func runSession(command []string) (int, error) {
 		return 0, fmt.Errorf("run %s: %w", command[0], runErr)
 	}
 	return 0, nil
+}
+
+// appendGitConfigOverride adds one config key/value pair to the
+// GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n environment-based
+// config overlay that git (>= 2.31) reads as if it were passed via `-c` on
+// every invocation — see githooks(5) / git-config(1). It respects any
+// GIT_CONFIG_COUNT already present in env (from the parent shell) instead
+// of assuming it owns index 0.
+func appendGitConfigOverride(env []string, key, value string) []string {
+	count := 0
+	countIdx := -1
+	for i, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "GIT_CONFIG_COUNT="); ok {
+			countIdx = i
+			if n, err := strconv.Atoi(v); err == nil {
+				count = n
+			}
+			break
+		}
+	}
+
+	env = append(env,
+		fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", count, key),
+		fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", count, value),
+	)
+	newCount := fmt.Sprintf("GIT_CONFIG_COUNT=%d", count+1)
+	if countIdx >= 0 {
+		env[countIdx] = newCount
+	} else {
+		env = append(env, newCount)
+	}
+	return env
 }
 
 // lookPathIn resolves file to an executable path using PATH from env
@@ -225,10 +285,13 @@ func snapshotKnownRemotes(realGit, repoDir string) []string {
 }
 
 // buildChildEnv constructs the environment injected into the launched
-// agent process tree: proxy + CA env vars, and the session-scoped git shim
-// prepended to PATH. Per ARCHITECTURE.md 0.5, CA trust is scoped to what
-// Codex CLI and curl need — not a general N-harness compatibility matrix.
-func buildChildEnv(sessionID, sessionDir, dbPath, realGit, proxyAddr, caCertPath, shimBinDir string) []string {
+// agent process tree: proxy + CA env vars, the session-scoped git shim
+// prepended to PATH, and the session-scoped pre-push hook wired in via
+// GIT_CONFIG_* overrides (not ~/.gitconfig). Per ARCHITECTURE.md 0.5, CA
+// trust is scoped to what each supported harness specifically needs —
+// Codex CLI + curl in v0.1, Claude Code added in v0.2 — not a general
+// N-harness compatibility matrix.
+func buildChildEnv(sessionID, sessionDir, dbPath, realGit, proxyAddr, caCertPath, shimBinDir, hooksDir string) []string {
 	env := os.Environ()
 
 	set := func(env []string, key, val string) []string {
@@ -283,6 +346,18 @@ func buildChildEnv(sessionID, sessionDir, dbPath, realGit, proxyAddr, caCertPath
 	env = set(env, "SSL_CERT_FILE", caCertPath)
 	env = set(env, "CURL_CA_BUNDLE", caCertPath)
 	env = set(env, "GIT_SSL_CAINFO", caCertPath)
+	// Second harness (v0.2): Claude Code's Node.js runtime reads
+	// NODE_EXTRA_CA_CERTS rather than SSL_CERT_FILE.
+	env = set(env, "NODE_EXTRA_CA_CERTS", caCertPath)
+
+	// Wire in the session-scoped pre-push hook via env-based git config
+	// overlay (GIT_CONFIG_COUNT/KEY_n/VALUE_n, Git >= 2.31) rather than
+	// writing to the user's real ~/.gitconfig — this stacks on top of
+	// existing config instead of replacing it (unlike GIT_CONFIG_GLOBAL,
+	// which would also blank out the user's own aliases/credential
+	// helpers). Any GIT_CONFIG_* the parent shell already set is
+	// preserved and appended to, not clobbered.
+	env = appendGitConfigOverride(env, "core.hooksPath", hooksDir)
 
 	for i, kv := range env {
 		if strings.HasPrefix(kv, "PATH=") {

@@ -8,7 +8,8 @@
 > - **v3**：`Session Supervisor` 降级为一种 Session Provider、PID tree 改用 Attribution Engine、Runtime Sensor 拆成 Process/File Plane、路线图新增 Enforce Preview 里程碑、tamper evidence 拆成 Local/Trusted Evidence 两级、"单二进制"从架构约束降级为分发目标。
 > - **v4**：第三轮 review 的结论是 v3 已经对 v0.1 产生了明显的过度设计。本版本把文档拆成 v0.1 MVP（第 0 节，只有 6 个概念）和 Target Architecture（第 1 节起，定义演进边界，不是包结构），并修正了 per-session proxy port、Attribution Engine confidence 建模、Enforced Mode 独立成 Platform Enforcement Track 这三处设计。
 > - **v5**（架构 review 收口）：第四轮 review 的结论是"这版可以收口了"，做最后一次范围收缩：去掉 global hook、去掉 YAML policy、去掉 `seq`、限定一个 OS（macOS）+ 一个 harness（Codex CLI），并补上三处实现级别的坑（git shim 必须在改 `PATH` 前用 `exec.LookPath` 解析真实 git 路径、shim 必须 session-scoped 临时注入、CA 信任只走环境变量不改系统信任链）。`payload_json` 明确禁止保存原始 secret/body，只存 fingerprint。
-> - **v6**（本版本）：第五轮 review 分两部分。**架构侧**补上了文档此前完全没覆盖的一个盲区——`leashd`/proxy/git shim 自身故障时该 fail-open 还是 fail-closed（见新增的第 0.7 节），结论是安全敏感的出站动作必须 fail-closed 且绝不静默降级，非安全敏感的本地只读操作可以优雅降级；这三条已经补进第 0.9 节的 invariant 列表。**产品/商业侧**的结论更值得警惕：原始"抓住 ZCode 事件几个月窗口期"这个创业叙事已经不成立（CrowdStrike Falcon Guardian、Zscaler Agentic AI、Netskope 都已在 2026 年正面进入这个赛道），需要把定位从"没人做"换成"开发者原生、跨 harness、语义级的 coding-agent runtime 控制层"，商业模式定为 Open Core，买家结构是 Platform/DevSecOps champion + Security 经济买家的三角关系，而不是简单的"开发者 vs CISO"。这部分内容记录在新建的 [PRODUCT-STRATEGY.md](PRODUCT-STRATEGY.md) 里，不混进本文档——技术架构收口后不应该再被产品讨论稀释。
+> - **v7**（本版本）：v0.1 实现完成、经安全 review 修复 6 个真实漏洞（V1-V6）后发布，补了测试和 CI（GitHub Actions，macOS runner，build/vet/gofmt/test -race）。随后开始实现 v0.2（Core Track）：**YAML policy 引擎**上线（`internal/policy/config.go`，域名 allow/deny + `github.com` 的 action 级策略，如限制 repo/gist 创建的 org），取代 v0.1 写死的"任何命中就 block"；**全局 `pre-push` hook** 作为 shim 的 defense-in-depth 补充上线（`internal/gitshim/hook.go`），通过 session 级 `GIT_CONFIG_COUNT/KEY_n/VALUE_n` 环境变量覆盖注入 `core.hooksPath`，不触碰用户真实的 `~/.gitconfig`；`leash doctor` 命令上线（覆盖状态自检，对应第 8 节）；第二个 harness（Claude Code，`NODE_EXTRA_CA_CERTS`）的 CA 注入已加上。Attribution Engine 和 Runtime Sensor · Process Plane 仍在推进中。
+> - **v6**：第五轮 review 分两部分。**架构侧**补上了文档此前完全没覆盖的一个盲区——`leashd`/proxy/git shim 自身故障时该 fail-open 还是 fail-closed（见新增的第 0.7 节），结论是安全敏感的出站动作必须 fail-closed 且绝不静默降级，非安全敏感的本地只读操作可以优雅降级；这三条已经补进第 0.9 节的 invariant 列表。**产品/商业侧**的结论更值得警惕：原始"抓住 ZCode 事件几个月窗口期"这个创业叙事已经不成立（CrowdStrike Falcon Guardian、Zscaler Agentic AI、Netskope 都已在 2026 年正面进入这个赛道），需要把定位从"没人做"换成"开发者原生、跨 harness、语义级的 coding-agent runtime 控制层"，商业模式定为 Open Core，买家结构是 Platform/DevSecOps champion + Security 经济买家的三角关系，而不是简单的"开发者 vs CISO"。这部分内容记录在新建的 [PRODUCT-STRATEGY.md](PRODUCT-STRATEGY.md) 里，不混进本文档——技术架构收口后不应该再被产品讨论稀释。
 
 ---
 
@@ -460,8 +461,15 @@ Trusted Evidence（企业可选）
 
 ### 10.1 Leash Core Track（纯 Go，不含特权组件）
 
-1. **v0.1 — 第 0 节范围**：Session（struct）+ Proxy + Git Shim + `Scan()` + Policy + 单表 Event。Demo：`.env` POST → BLOCK，`git push` 到陌生仓库 → BLOCK。命令行输出即可。
-2. **v0.2 — Process visibility**：secret 检测规则库、Runtime Sensor · Process Plane（exec/argv/进程谱系）、**Attribution Engine 在此时才出生**（第 5.2 节的证据模型）、**重新引入 YAML policy（域名/组织粒度）和 `core.hooksPath` 全局 hook**（v0.1 为了收缩范围砍掉的两项，此时补回）、`leash doctor`、第二个 harness（如 Claude Code，需要 `NODE_EXTRA_CA_CERTS`）。
+1. **v0.1 — 第 0 节范围**：Session（struct）+ Proxy + Git Shim + `Scan()` + Policy + 单表 Event。Demo：`.env` POST → BLOCK，`git push` 到陌生仓库 → BLOCK。命令行输出即可。**已完成**：经安全 review 修复 6 个真实漏洞，测试+CI 上线。
+2. **v0.2 — Process visibility**（进行中）：
+   - ✅ **重新引入 YAML policy**（域名 allow/deny + `github.com` action 级策略）—— `internal/policy/config.go`
+   - ✅ **重新引入 `core.hooksPath` 全局 hook**（session 级 `GIT_CONFIG_*` 注入，不碰 `~/.gitconfig`）—— `internal/gitshim/hook.go`
+   - ✅ `leash doctor`（第 8 节覆盖状态自检）—— `cmd/leash/doctor.go`
+   - ✅ 第二个 harness（Claude Code，`NODE_EXTRA_CA_CERTS`）
+   - ⏳ secret 检测规则库扩充
+   - ⏳ Runtime Sensor · Process Plane（exec/argv/进程谱系）
+   - ⏳ **Attribution Engine**（第 5.2 节的证据模型，随 Process Plane 一起出生）
 3. **v0.3 — Flight recorder**：Dashboard 时间线、Git diff viewer、session 回放、Runtime Sensor · File Plane MVP、retention。
 4. **v0.4 — Core 成熟化**：detection 准确率、性能、multi-session、Attach Provider / Harness Adapter（第一次真正需要 `SessionProvider` 抽象的时候）。
 5. **v0.5 — Enterprise Evidence（仍是 Core，纯软件）**：Local Integrity 默认具备，Trusted Evidence 作为企业可选项，policy snapshot，HTML/PDF 合规报告导出。

@@ -1,7 +1,7 @@
-// Package proxy implements the v0.1 Egress Sensor: an HTTP(S) MITM proxy
-// built on elazarl/goproxy (ARCHITECTURE.md section 7.2 — don't self-roll
-// CONNECT/TLS handling). It only inspects requests, not responses, and has
-// no domain policy yet — matching the v0.1 Support Matrix (section 0.2).
+// Package proxy implements the Egress Sensor: an HTTP(S) MITM proxy built
+// on elazarl/goproxy (ARCHITECTURE.md section 7.2 — don't self-roll
+// CONNECT/TLS handling). It only inspects requests, not responses
+// (ARCHITECTURE.md 0.2).
 package proxy
 
 import (
@@ -38,11 +38,17 @@ type Proxy struct {
 	http     *http.Server
 	sessID   string
 	st       *store.Store
+	policy   *policy.Config
 }
 
 // New creates a proxy bound to 127.0.0.1:0 (kernel-assigned port) and
 // configures it to MITM all CONNECT tunnels using the given local CA.
-func New(sessionID string, st *store.Store, caCertPEM, caKeyPEM []byte) (*Proxy, error) {
+// cfg is nil-safe: a nil cfg is treated as policy.Default().
+func New(sessionID string, st *store.Store, caCertPEM, caKeyPEM []byte, cfg *policy.Config) (*Proxy, error) {
+	if cfg == nil {
+		cfg = policy.Default()
+	}
+
 	cert, err := tls.X509KeyPair(caCertPEM, caKeyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("load leash CA: %w", err)
@@ -54,7 +60,7 @@ func New(sessionID string, st *store.Store, caCertPEM, caKeyPEM []byte) (*Proxy,
 		return nil, fmt.Errorf("bind proxy listener: %w", err)
 	}
 
-	p := &Proxy{Listener: ln, sessID: sessionID, st: st}
+	p := &Proxy{Listener: ln, sessID: sessionID, st: st, policy: cfg}
 
 	server := goproxy.NewProxyHttpServer()
 	server.Verbose = false
@@ -114,16 +120,26 @@ func (p *Proxy) inspect(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, 
 	}
 
 	findings := detect.Scan(scanned)
-	decision := policy.Decide(findings)
 
-	rules := make([]string, 0, len(findings))
-	for _, f := range findings {
-		rules = append(rules, f.Rule)
+	policyFindings := make([]policy.Finding, len(findings))
+	rules := make([]string, len(findings))
+	for i, f := range findings {
+		policyFindings[i] = policy.Finding{Rule: f.Rule, Confidence: f.Confidence}
+		rules[i] = f.Rule
 	}
 
+	decision, reason := p.policy.Decide(policyFindings, policy.Request{
+		Host:   r.Host,
+		Method: r.Method,
+		Path:   r.URL.Path,
+	})
+
 	severity := "info"
-	if decision == store.Block {
+	switch decision {
+	case store.Block:
 		severity = "high"
+	case store.Warn:
+		severity = "medium"
 	}
 
 	if err := p.st.InsertEvent(p.sessID, "network", severity, decision, map[string]any{
@@ -137,14 +153,18 @@ func (p *Proxy) inspect(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, 
 		"method":        r.Method,
 		"bytes":         len(body),
 		"matched_rules": rules,
+		"reason":        reason,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "leash: failed to record network event: %v\n", err)
 	}
 
 	if decision == store.Block {
-		fmt.Fprintf(os.Stderr, "leash: BLOCK network %s %s (%v)\n", r.Method, r.Host, rules)
+		fmt.Fprintf(os.Stderr, "leash: BLOCK network %s %s (%s)\n", r.Method, r.Host, reason)
 		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusForbidden,
-			fmt.Sprintf("blocked by leash: matched %v", rules))
+			fmt.Sprintf("blocked by leash: %s", reason))
+	}
+	if decision == store.Warn {
+		fmt.Fprintf(os.Stderr, "leash: WARN network %s %s (%s)\n", r.Method, r.Host, reason)
 	}
 
 	return r, nil
