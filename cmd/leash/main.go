@@ -101,6 +101,17 @@ func runSession(command []string) (int, error) {
 	}
 	defer st.Close()
 
+	// Retention (ARCHITECTURE.md 5.1/10.1): prune on session start rather
+	// than running a background timer — simplest thing that keeps the
+	// database bounded without adding a long-lived goroutine outside a
+	// session's lifetime. A failed prune is logged, not fatal: it affects
+	// disk usage, not this session's correctness.
+	if n, err := st.Prune(cfg.Retention.Duration()); err != nil {
+		fmt.Fprintf(os.Stderr, "leash: warning: retention prune failed: %v\n", err)
+	} else if n > 0 {
+		fmt.Fprintf(os.Stderr, "leash: pruned %d event(s) older than retention window\n", n)
+	}
+
 	px, err := proxy.New(sessionID, st, certPEM, keyPEM, cfg)
 	if err != nil {
 		return 0, fmt.Errorf("start proxy: %w", err)
@@ -183,8 +194,8 @@ func runSession(command []string) (int, error) {
 
 	summary, sumErr := st.Summary(sessionID)
 	if sumErr == nil {
-		fmt.Fprintf(os.Stderr, "leash: session %s ended — allow=%d warn=%d block=%d, processes observed=%d\n",
-			sessionID, summary.Allow, summary.Warn, summary.Block, summary.ProcessesObserved)
+		fmt.Fprintf(os.Stderr, "leash: session %s ended — allow=%d warn=%d block=%d, processes observed=%d, diffs recorded=%d\n",
+			sessionID, summary.Allow, summary.Warn, summary.Block, summary.ProcessesObserved, summary.DiffStatsRecorded)
 	}
 
 	if runErr != nil {

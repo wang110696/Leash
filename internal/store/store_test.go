@@ -3,6 +3,7 @@ package store
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func openTestStore(t *testing.T) *Store {
@@ -97,6 +98,64 @@ func TestConcurrentWrites(t *testing.T) {
 	}
 	if sum.Allow != writers*perWriter {
 		t.Fatalf("Summary.Allow = %d; want %d", sum.Allow, writers*perWriter)
+	}
+}
+
+func TestPrune(t *testing.T) {
+	st := openTestStore(t)
+
+	now := time.Now()
+	insertAt := func(sessionID string, ts time.Time) {
+		t.Helper()
+		if _, err := st.db.Exec(
+			`INSERT INTO events (session_id, ts, kind, severity, decision, payload_json) VALUES (?, ?, 'network', 'info', 'allow', '{}')`,
+			sessionID, ts.UnixMilli(),
+		); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	insertAt("old", now.Add(-40*24*time.Hour))    // older than 30d retention
+	insertAt("old", now.Add(-31*24*time.Hour))    // just past 30d
+	insertAt("recent", now.Add(-1*time.Hour))     // well within retention
+	insertAt("recent", now.Add(-29*24*time.Hour)) // just within 30d
+
+	n, err := st.Prune(30 * 24 * time.Hour)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("Prune removed %d rows; want 2", n)
+	}
+
+	var remaining int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM events`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 2 {
+		t.Fatalf("remaining rows = %d; want 2", remaining)
+	}
+
+	var oldCount int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM events WHERE session_id = 'old'`).Scan(&oldCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldCount != 0 {
+		t.Fatalf("old-session rows remaining = %d; want 0", oldCount)
+	}
+}
+
+func TestPruneNoOpWhenNothingOld(t *testing.T) {
+	st := openTestStore(t)
+	if err := st.InsertEvent("sess", "network", "info", Allow, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := st.Prune(30 * 24 * time.Hour)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("Prune removed %d rows; want 0 (nothing is old)", n)
 	}
 }
 

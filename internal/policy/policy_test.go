@@ -2,6 +2,7 @@ package policy
 
 import (
 	"testing"
+	"time"
 
 	"github.com/wang110696/Leash/internal/store"
 )
@@ -117,5 +118,17 @@ func TestLoadMissingFileReturnsDefault(t *testing.T) {
 	}
 	if len(cfg.Egress.AllowDomains) != 0 || len(cfg.Egress.DenyDomains) != 0 {
 		t.Fatalf("Load(missing) = %+v; want the zero-value Default()", cfg)
+	}
+}
+
+func TestRetentionDuration(t *testing.T) {
+	if got := (RetentionConfig{}).Duration(); got != 30*24*time.Hour {
+		t.Errorf("zero-value RetentionConfig.Duration() = %v; want 30 days default", got)
+	}
+	if got := (RetentionConfig{Days: 7}).Duration(); got != 7*24*time.Hour {
+		t.Errorf("RetentionConfig{Days:7}.Duration() = %v; want 7 days", got)
+	}
+	if got := (RetentionConfig{Days: -5}).Duration(); got != 30*24*time.Hour {
+		t.Errorf("negative Days should fall back to default: got %v", got)
 	}
 }

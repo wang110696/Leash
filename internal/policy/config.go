@@ -8,6 +8,7 @@ package policy
 import (
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -19,8 +20,24 @@ import (
 // restrictions, no GitHub action restrictions — so a session with no
 // policy file behaves identically to before this feature existed.
 type Config struct {
-	Egress EgressConfig `yaml:"egress"`
-	GitHub GitHubConfig `yaml:"github"`
+	Egress    EgressConfig    `yaml:"egress"`
+	GitHub    GitHubConfig    `yaml:"github"`
+	Retention RetentionConfig `yaml:"retention"`
+}
+
+// RetentionConfig controls how long recorded events are kept
+// (ARCHITECTURE.md 5.1/10.1). Zero/unset Days means the default (30).
+type RetentionConfig struct {
+	Days int `yaml:"days"`
+}
+
+// Duration returns the configured retention window, defaulting to 30 days.
+func (r RetentionConfig) Duration() time.Duration {
+	days := r.Days
+	if days <= 0 {
+		days = 30
+	}
+	return time.Duration(days) * 24 * time.Hour
 }
 
 type EgressConfig struct {

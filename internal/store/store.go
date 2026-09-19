@@ -63,14 +63,16 @@ const (
 )
 
 // Summary reports how many events of each decision were recorded for a
-// session — used for the end-of-session CLI banner. ProcessesObserved is
-// counted separately from Allow: process_exec events (Runtime Sensor ·
-// Process Plane, v0.2) are record-only informational events, not
-// allow/block decisions about a security-sensitive action, and mixing
-// them into Allow would make that count misleading.
+// session — used for the end-of-session CLI banner. ProcessesObserved and
+// DiffStatsRecorded are counted separately from Allow: process_exec
+// (Runtime Sensor · Process Plane, v0.2) and git_diff_stat (v0.3) events
+// are record-only informational enrichment, not allow/block decisions
+// about a security-sensitive action, and mixing them into Allow would make
+// that count misleading.
 type Summary struct {
 	Allow, Warn, Block int
 	ProcessesObserved  int
+	DiffStatsRecorded  int
 }
 
 func (s *Store) Summary(sessionID string) (Summary, error) {
@@ -89,8 +91,12 @@ func (s *Store) Summary(sessionID string) (Summary, error) {
 		if err := rows.Scan(&decision, &kind, &n); err != nil {
 			return Summary{}, err
 		}
-		if kind == "process_exec" {
+		switch kind {
+		case "process_exec":
 			sum.ProcessesObserved += n
+			continue
+		case "git_diff_stat":
+			sum.DiffStatsRecorded += n
 			continue
 		}
 		switch Decision(decision) {
@@ -118,4 +124,26 @@ func (s *Store) InsertEvent(sessionID, kind, severity string, decision Decision,
 		sessionID, time.Now().UnixMilli(), kind, severity, string(decision), string(buf),
 	)
 	return err
+}
+
+// Prune deletes events older than olderThan and returns how many rows were
+// removed (ARCHITECTURE.md 5.1/10.1 "retention"). It runs an unconditional
+// VACUUM afterward so disk usage actually shrinks — SQLite doesn't release
+// freed pages back to the filesystem on its own.
+func (s *Store) Prune(olderThan time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-olderThan).UnixMilli()
+	res, err := s.db.Exec(`DELETE FROM events WHERE ts < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return n, err
+	}
+	if n > 0 {
+		if _, err := s.db.Exec(`VACUUM`); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
