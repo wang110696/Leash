@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+
 	"github.com/wang110696/Leash/internal/store"
 )
 
@@ -164,6 +166,124 @@ func TestWatcher_CapsEvents(t *testing.T) {
 	}
 }
 
+// TestHandle_RejectsPathEscapingRoot is a regression test: a single
+// strings.TrimPrefix(rel, "../") used to "clean" an escaped path, but only
+// strips one level ("../../x" came out as "../x": still escaped). handle()
+// now refuses to record any event whose path isn't local to root at all,
+// tested directly here rather than by reproducing the exact symlink race
+// that could produce one.
+func TestHandle_RejectsPathEscapingRoot(t *testing.T) {
+	root := t.TempDir()
+	st := testStore(t)
+	w, err := New("sess1", root, st)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+
+	w.handle(fsnotify.Event{Name: filepath.Join(filepath.Dir(root), "outside.txt"), Op: fsnotify.Write})
+
+	events, err := st.ListEvents("sess1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range events {
+		if e.Kind == "file_mutation" {
+			t.Fatalf("recorded a file_mutation event for a path outside root: %s", e.PayloadJSON)
+		}
+	}
+}
+
+// TestWatcher_DoesNotFollowNewSymlinkDirectory is a regression test: a
+// newly created symlink pointing outside root must not be followed into a
+// watch (previously used os.Stat, which follows symlinks; now os.Lstat).
+func TestWatcher_DoesNotFollowNewSymlinkDirectory(t *testing.T) {
+	root := t.TempDir()
+	outsideDir := t.TempDir() // a distinct temp dir, definitely outside root
+	st := testStore(t)
+
+	w, err := New("sess1", root, st)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	if err := os.Symlink(outsideDir, filepath.Join(root, "link-to-outside")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // let the watcher process the symlink's own Create event
+
+	// If the watcher had followed the symlink and added a watch on
+	// outsideDir, this write would generate an event.
+	if err := os.WriteFile(filepath.Join(outsideDir, "secret.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	events, err := st.ListEvents("sess1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(events, "secret.txt") {
+		t.Fatalf("watcher followed a newly created symlink outside root: %+v", events)
+	}
+}
+
+// TestWatcher_DegradesToRootOnlyWhenTooManyDirs is a regression test for
+// the fd-exhaustion finding: when a tree has more directories than the
+// (fd-limit-aware) budget allows, New() must fall back to watching only
+// root rather than either silently watching an unpredictable subset or
+// exhausting file descriptors the rest of the process needs too (the
+// Egress Sensor's listening socket shares this process's fd table).
+func TestWatcher_DegradesToRootOnlyWhenTooManyDirs(t *testing.T) {
+	origCap := MaxWatchedDirs
+	MaxWatchedDirs = 3
+	defer func() { MaxWatchedDirs = origCap }()
+
+	root := t.TempDir()
+	for i := 0; i < 10; i++ {
+		if err := os.MkdirAll(filepath.Join(root, fmt.Sprintf("dir%d", i)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := testStore(t)
+
+	w, err := New("sess1", root, st)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	if err := os.WriteFile(filepath.Join(root, "top.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "dir5", "nested.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForEvents(t, st, "sess1", 1, 3*time.Second)
+	time.Sleep(300 * time.Millisecond) // give the (absent) nested-dir event a chance to show up too, if it wrongly would
+
+	events, err := st.ListEvents("sess1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(events, "top.txt") {
+		t.Fatalf("expected root-level write to still be recorded in degraded mode: %+v", events)
+	}
+	if contains(events, "nested.txt") {
+		t.Fatalf("subdirectory write was recorded even though the watcher should have degraded to root-only: %+v", events)
+	}
+}
+
 func contains(events []store.Event, substr string) bool {
 	for _, e := range events {
 		if strings.Contains(e.PayloadJSON, substr) {
@@ -171,4 +291,15 @@ func contains(events []store.Event, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestRaiseFDLimit(t *testing.T) {
+	before := getCurrentFDLimit()
+	got := raiseFDLimit()
+	if got == 0 {
+		t.Fatal("raiseFDLimit() = 0; want a positive limit (Getrlimit should work in any test environment)")
+	}
+	if got < before {
+		t.Fatalf("raiseFDLimit() = %d; want at least the pre-existing limit %d (never lower it)", got, before)
+	}
 }

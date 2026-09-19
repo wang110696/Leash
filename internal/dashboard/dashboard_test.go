@@ -24,6 +24,7 @@ func testStore(t *testing.T) *store.Store {
 func get(t *testing.T, h http.Handler, path string) (int, string) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Host = "127.0.0.1" // httptest.NewRequest defaults Host to "example.com", which requireLocalHost now correctly rejects
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	body, err := io.ReadAll(rec.Result().Body)
@@ -153,5 +154,41 @@ func TestSessionHandler_MultilineFieldRendersAsPre(t *testing.T) {
 	_, body := get(t, h, "/session/sess-diff")
 	if !strings.Contains(body, "<pre>README.md") {
 		t.Fatalf("expected multiline stat field to render inside <pre>: %s", body)
+	}
+}
+
+// TestRequireLocalHost_RejectsRebindingHost is a regression test for DNS
+// rebinding: a request whose Host header names an external domain (what a
+// browser would send if that domain's DNS were re-pointed at 127.0.0.1)
+// must be rejected even though the *listener* is loopback-only — Host
+// header, not the socket's bind address, is what a browser's
+// same-origin check actually keys off.
+func TestRequireLocalHost_RejectsRebindingHost(t *testing.T) {
+	h := New(testStore(t))
+
+	cases := []string{"evil.example", "evil.example:1234", "attacker.com"}
+	for _, host := range cases {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("Host: %q => status %d; want 403 (DNS rebinding regression)", host, rec.Code)
+		}
+	}
+}
+
+func TestRequireLocalHost_AllowsLocalHostForms(t *testing.T) {
+	h := New(testStore(t))
+
+	cases := []string{"127.0.0.1", "127.0.0.1:8080", "localhost", "localhost:8080"}
+	for _, host := range cases {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("Host: %q => status %d; want 200", host, rec.Code)
+		}
 	}
 }

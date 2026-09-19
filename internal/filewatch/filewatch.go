@@ -13,12 +13,22 @@
 //
 // fsnotify doesn't support recursive watching natively; this package
 // walks the tree once at startup and adds a watch per directory, then adds
-// new watches for directories created during the session. Two safety
+// new watches for directories created during the session. Several safety
 // valves keep this from becoming a liability during an active coding
 // session (compilers, package managers, and editors can generate a lot of
-// churn):
+// churn, and a mid-sized repo can have far more directories than an OS's
+// default file-descriptor limit allows):
 //   - a fixed exclude-list of common noisy directories (.git, node_modules,
 //     vendor, build output, ...) skipped entirely, not even watched
+//   - the process's open-file soft limit is raised at startup, and the
+//     number of directories watched is capped based on the limit actually
+//     achieved — if a repo has more directories than fit, watching
+//     degrades to just the root (non-recursive) rather than silently
+//     leaving an unpredictable subset unwatched or, worse, exhausting file
+//     descriptors that the Egress Sensor's own listening socket needs too
+//     (found in the v0.3 security review: this process's proxy and file
+//     watcher share one fd table, so fd exhaustion here could take the
+//     network proxy down, not just File Plane)
 //   - a hard cap on total events recorded per session; once hit, watching
 //     continues (so we don't lose the "it's still running" signal) but
 //     new events are silently dropped rather than let the database or
@@ -30,7 +40,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+	"syscall"
 
 	"github.com/fsnotify/fsnotify"
 
@@ -42,6 +52,26 @@ import (
 // A var (not a const) so tests can lower it to exercise the cap without
 // generating 5000 real filesystem events.
 var MaxEventsPerSession = 5000
+
+// MaxWatchedDirs caps how many directories New will place a watch on
+// before giving up on full recursive coverage and falling back to
+// watching just root. A var for the same reason as MaxEventsPerSession —
+// tests need to exercise the degrade path without creating thousands of
+// real directories. The effective cap used at runtime is also bounded by
+// how many file descriptors are actually available (see raiseFDLimit).
+var MaxWatchedDirs = 2000
+
+// fdHeadroom is how many file descriptors New() deliberately leaves
+// unused by the directory watch budget, reserved for the rest of the
+// process's needs (stdio, the SQLite connection, the Egress Sensor's
+// listening socket and in-flight connections).
+const fdHeadroom = 64
+
+// hardFDCap is a concrete ceiling used when the OS reports an
+// effectively-unlimited hard limit (macOS commonly does) that the kernel
+// will still refuse in practice — trusting a real, moderate number is
+// more reliable than trusting the reported ceiling.
+const hardFDCap = 10240
 
 // excludedDirNames are skipped entirely — not watched, not descended into.
 // This is a fixed list, not configurable in v0.3 (ARCHITECTURE.md's
@@ -73,34 +103,140 @@ type Watcher struct {
 
 // New creates a Watcher rooted at root (typically the session's working
 // directory) and adds watches for root and every non-excluded
-// subdirectory. A failure here is non-fatal to the caller by design — File
-// Plane visibility is best-effort, not a session precondition.
+// subdirectory, unless the tree is too large for the available file
+// descriptors (see the package doc), in which case it watches only root.
+// A failure here is non-fatal to the caller by design — File Plane
+// visibility is best-effort, not a session precondition.
 func New(sessionID, root string, st *store.Store) (*Watcher, error) {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, fmt.Errorf("create fsnotify watcher: %w", err)
 	}
-
 	w := &Watcher{sessionID: sessionID, root: root, st: st, fsw: fsw}
 
-	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	limit := raiseFDLimit()
+	effectiveCap := MaxWatchedDirs
+	if limit > 0 && int(limit)-fdHeadroom < effectiveCap {
+		effectiveCap = int(limit) - fdHeadroom
+	}
+	if effectiveCap < 1 {
+		effectiveCap = 1
+	}
+
+	dirs, err := eligibleDirs(root, effectiveCap+1)
+	if err != nil {
+		fsw.Close()
+		return nil, fmt.Errorf("walk %s: %w", root, err)
+	}
+
+	if len(dirs) > effectiveCap {
+		if err := fsw.Add(root); err != nil {
+			fsw.Close()
+			return nil, fmt.Errorf("watch %s: %w", root, err)
+		}
+		fmt.Fprintf(os.Stderr,
+			"leash: warning: %s has more than %d directories to watch (fd budget); File Plane degraded to root-only, not fully recursive\n",
+			root, effectiveCap)
+		return w, nil
+	}
+
+	var failed int
+	for _, dir := range dirs {
+		if err := fsw.Add(dir); err != nil {
+			failed++
+		}
+	}
+	if failed > 0 {
+		// Per the fail-safe philosophy (ARCHITECTURE.md 0.7/0.9): a
+		// best-effort sensor can have gaps, but it must not have them
+		// silently. `_ = fsw.Add(path)` used to swallow this entirely.
+		fmt.Fprintf(os.Stderr,
+			"leash: warning: %d of %d directories under %s could not be watched; File Plane coverage is incomplete\n",
+			failed, len(dirs), root)
+	}
+
+	return w, nil
+}
+
+// eligibleDirs walks root and returns every directory that would be
+// watched (root itself plus non-excluded subdirectories), stopping early
+// once it's collected more than limit — the caller only needs to know
+// "does this fit the budget", not the full list, once it doesn't.
+func eligibleDirs(root string, limit int) ([]string, error) {
+	var dirs []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil // skip unreadable entries rather than aborting the whole walk
 		}
 		if !d.IsDir() {
 			return nil
 		}
-		if d.Name() != "." && excludedDirNames[d.Name()] {
+		// Compare by path, not by name, to decide whether this is the
+		// walk's own root: comparing names (e.g. against ".") only works
+		// when root is literally ".", but main.go always passes an
+		// absolute cwd — a repo whose top-level directory happened to be
+		// named e.g. "build" would otherwise exclude itself entirely.
+		if path != root && excludedDirNames[d.Name()] {
 			return filepath.SkipDir
 		}
-		_ = fsw.Add(path) // best-effort per-directory; one bad dir shouldn't stop the rest
+		dirs = append(dirs, path)
+		if len(dirs) > limit {
+			return filepath.SkipAll
+		}
 		return nil
-	}); err != nil {
-		fsw.Close()
-		return nil, fmt.Errorf("walk %s: %w", root, err)
-	}
+	})
+	return dirs, err
+}
 
-	return w, nil
+// getCurrentFDLimit reports the process's current open-file soft limit (0
+// if it can't be read). Exported indirectly via CurrentFDLimit for
+// `leash doctor`.
+func getCurrentFDLimit() uint64 {
+	var rl syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
+		return 0
+	}
+	return rl.Cur
+}
+
+// CurrentFDLimit is the exported form of getCurrentFDLimit, for
+// `leash doctor` to report the fd budget outside of a session.
+func CurrentFDLimit() uint64 { return getCurrentFDLimit() }
+
+// RaiseFDLimit is the exported form of raiseFDLimit, for `leash doctor` to
+// report what fd budget a session would actually get without needing to
+// construct a full Watcher.
+func RaiseFDLimit() uint64 { return raiseFDLimit() }
+
+// raiseFDLimit attempts to raise the process's open-file soft limit and
+// returns the resulting limit (0 if it couldn't even be read). macOS in
+// particular often defaults the soft limit to 256, which a mid-sized
+// repo's directory count can exceed on its own — see the package doc for
+// why running out matters beyond just File Plane.
+func raiseFDLimit() uint64 {
+	var rl syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
+		return 0
+	}
+	target := rl.Max
+	if target > hardFDCap {
+		target = hardFDCap
+	}
+	if target <= rl.Cur {
+		return rl.Cur
+	}
+	rl.Cur = target
+	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
+		// The reported Max wasn't actually settable; don't just give up —
+		// re-read whatever the limit ended up being (some platforms allow
+		// a partial raise even when the requested value is rejected).
+		var cur syscall.Rlimit
+		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &cur); err == nil {
+			return cur.Cur
+		}
+		return rl.Cur
+	}
+	return rl.Cur
 }
 
 func (w *Watcher) Close() error { return w.fsw.Close() }
@@ -134,13 +270,34 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 	}
 
 	if ev.Has(fsnotify.Create) {
-		if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
-			_ = w.fsw.Add(ev.Name) // watch newly created directories too
+		// Lstat, not Stat: a newly created symlink must not be followed
+		// into a watch. `git checkout` of a repo containing a symlink
+		// (e.g. one pointing at /etc or $HOME) is a completely ordinary
+		// event — following it here would start watching, and recording
+		// mutations under, a path outside the session root entirely
+		// (found in the v0.3 security review).
+		if info, err := os.Lstat(ev.Name); err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+			_ = w.fsw.Add(ev.Name) // watch newly created directories too; best-effort like the initial walk
 		}
 	}
 
 	op := operationName(ev.Op)
 	if op == "" {
+		return
+	}
+
+	rel, err := filepath.Rel(w.root, ev.Name)
+	if err != nil {
+		return
+	}
+	if !filepath.IsLocal(rel) {
+		// The event path resolved outside the session root (e.g. via a
+		// symlinked directory that slipped past the check above through
+		// some other route). Don't record it — a single
+		// strings.TrimPrefix(rel, "../") used to "clean" this, but only
+		// strips one level, so "../../x" came out as "../x": still
+		// escaped, just less obviously. Refusing to record is simpler
+		// and actually correct.
 		return
 	}
 
@@ -152,16 +309,6 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 		return
 	}
 	w.count++
-
-	rel, err := filepath.Rel(w.root, ev.Name)
-	if err != nil {
-		rel = ev.Name
-	}
-	// Defensive: never let a path escape the session root into the stored
-	// event (e.g. via a symlink) as an absolute path — relative-only,
-	// matching the "don't leak more than necessary" posture applied to
-	// network paths (E5) and process argv.
-	rel = strings.TrimPrefix(rel, "../")
 
 	if err := w.st.InsertEvent(w.sessionID, "file_mutation", "info", store.Allow, map[string]any{
 		"path":      rel,

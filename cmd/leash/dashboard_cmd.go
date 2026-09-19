@@ -22,7 +22,12 @@ func runDashboard(args []string) int {
 		fmt.Fprintf(os.Stderr, "leash: %v\n", err)
 		return 1
 	}
-	dbPath := filepath.Join(home, ".leash", "events.db")
+	leashDir := filepath.Join(home, ".leash")
+	if err := os.MkdirAll(leashDir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "leash: %v\n", err)
+		return 1
+	}
+	dbPath := filepath.Join(leashDir, "events.db")
 
 	st, err := store.Open(dbPath)
 	if err != nil {
@@ -45,10 +50,30 @@ func runDashboard(args []string) int {
 		return 1
 	}
 
+	warnIfNotLoopback(ln.Addr().String())
+
 	fmt.Fprintf(os.Stderr, "leash: dashboard on http://%s (Ctrl+C to stop)\n", ln.Addr())
 	if err := http.Serve(ln, dashboard.New(st)); err != nil {
 		fmt.Fprintf(os.Stderr, "leash: dashboard server: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+// warnIfNotLoopback prints a prominent warning when the dashboard is bound
+// somewhere reachable from outside this machine. It's unauthenticated and
+// serves recorded audit data (hostnames, file paths, remote names, diff
+// stats) — binding it to a LAN-reachable address should be a deliberate,
+// visible choice, not something a user does by accident with one flag
+// (found in the v0.3 security review).
+func warnIfNotLoopback(addr string) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	switch host {
+	case "127.0.0.1", "localhost", "::1":
+		return
+	}
+	fmt.Fprintf(os.Stderr, "leash: WARNING: dashboard is bound to %s, not just this machine — anyone who can reach it on your network can read your audit data without logging in. Use a loopback address (127.0.0.1) unless you specifically mean to expose it.\n", addr)
 }

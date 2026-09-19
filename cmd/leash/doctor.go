@@ -13,8 +13,18 @@ import (
 	"path/filepath"
 
 	"github.com/wang110696/Leash/internal/ca"
+	"github.com/wang110696/Leash/internal/filewatch"
 	"github.com/wang110696/Leash/internal/policy"
 )
+
+// minWorkableFDLimit is the threshold below which File Plane is likely to
+// degrade to root-only watching on anything but a tiny repo (see
+// filewatch.MaxWatchedDirs / fdHeadroom). Found via the v0.3 security
+// review: macOS's often-low default soft limit (commonly 256) can be
+// exhausted by a mid-sized repo's directory count alone, and this
+// process's Egress Sensor shares the same fd table — so a low limit isn't
+// just a File Plane coverage question, it's worth surfacing here.
+const minWorkableFDLimit = 1024
 
 type doctorCheck struct {
 	name string
@@ -52,6 +62,15 @@ func runDoctor() int {
 
 	_, policyErr := policy.Load(filepath.Join(leashDir, "policy.yaml"))
 	checks = append(checks, doctorCheck{"policy.yaml parses (or absent, using defaults)", policyErr})
+
+	before := filewatch.CurrentFDLimit()
+	after := filewatch.RaiseFDLimit()
+	fdName := fmt.Sprintf("open-file limit workable for File Plane (soft limit %d, raised to %d)", before, after)
+	var fdErr error
+	if after < minWorkableFDLimit {
+		fdErr = fmt.Errorf("below %d; a mid-sized repo may degrade to root-only watching (ARCHITECTURE.md 10.1 v0.3 File Plane)", minWorkableFDLimit)
+	}
+	checks = append(checks, doctorCheck{fdName, fdErr})
 
 	return reportDoctor(checks)
 }

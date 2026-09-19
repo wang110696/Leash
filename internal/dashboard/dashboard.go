@@ -5,15 +5,23 @@
 // HTML — no JS framework, no CDN dependency, consistent with the project's
 // offline-first, no-external-dependency stance for a security tool.
 //
-// It's read-only and binds to 127.0.0.1 only (see cmd/leash: New's caller
-// picks the listener) — this views what Leash has already recorded, it
-// doesn't accept input.
+// It's read-only and is meant to be bound to 127.0.0.1 only (cmd/leash's
+// caller picks the listener and warns if it isn't) — this views what
+// Leash has already recorded, it doesn't accept input. New() itself
+// enforces the Host header regardless of what address the listener is
+// actually bound to (see requireLocalHost): binding to loopback alone
+// doesn't stop DNS rebinding, where a page served from an attacker's
+// domain gets that domain's DNS re-pointed at 127.0.0.1 — the browser
+// still treats requests to it as same-origin (same hostname it started
+// with), so a same-site fetch() can reach this server unless the server
+// itself checks that the Host header actually says something local.
 package dashboard
 
 import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -26,7 +34,26 @@ func New(st *store.Store) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", sessionsHandler(st))
 	mux.HandleFunc("/session/", sessionHandler(st))
-	return mux
+	return requireLocalHost(mux)
+}
+
+// requireLocalHost rejects any request whose Host header isn't a local
+// form (127.0.0.1, localhost, ::1 — with or without a port), regardless of
+// what address the listener is bound to. See the package doc for why this
+// matters even when the listener itself is loopback-only.
+func requireLocalHost(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		switch host {
+		case "127.0.0.1", "localhost", "::1", "[::1]":
+			next.ServeHTTP(w, r)
+		default:
+			http.Error(w, "leash dashboard: rejected non-local Host header", http.StatusForbidden)
+		}
+	})
 }
 
 func sessionsHandler(st *store.Store) http.HandlerFunc {

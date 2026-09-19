@@ -4,7 +4,8 @@
 > 知道 agent 运行了什么、改了什么、提交了什么、往哪里发了什么，并且在高风险动作发生前有能力做 policy decision。
 
 > **修订历史**
-> - **v9**（本版本）：找到一条比 Platform Enforcement Track（第 10.2 节原方案）轻量得多的"防绕过"路径——**动态库拦截**（macOS 用 `DYLD_INSERT_LIBRARIES`、Linux 用 `LD_PRELOAD`），在被启动进程的 `connect()` 这类系统库函数入口处直接接管，不管上层用的是 HTTP、SSH 还是任意协议，只要走系统库建连接就跑不掉，而且**不需要 root、不需要苹果/微软的特殊授权**，跟现在注入环境变量、伪装 git shim 是同一个"session 级别、启动时动手脚"的路子，只是这次动的是更底层的系统调用入口而不是环境变量。因此把 Best-effort 和 Enforced 之间拆出一个新的中间档位——**Interposed Mode**（第 3.2 节），详见第 10.2 节的重新拆分。这不是 Enforced Mode 的完全替代（对苹果签名保护的系统程序无效、对存心识破并卸载它的 agent 无效），但足以把"SSH 除 git 外的用途、裸 TCP、UDP"这几个此前完全看不见的出口（第 8.1 节）收进覆盖范围，而且可以留在 Core Track 里做，不需要拆到独立的平台工程线。
+> - **v10**（本版本）：第五轮安全 review，覆盖 v0.3 新代码（Dashboard、filewatch）和 v9 的 Interposed Mode 设计。**真正要修的代码问题两处**：① `internal/filewatch` 的 fd 耗尽风险——一个中等仓库的目录数很容易超过 macOS 常见的默认 256 fd 软上限，而且这个进程和 Egress Sensor 的监听 socket 共用一张 fd 表，fd 耗尽不只是 File Plane 覆盖变差，还可能连累网络拦截；修法是启动时尝试拉高 soft limit，按拉高后的实际 fd 预算给"要监控的目录数"设上限，超过就降级成只看顶层目录并明确告警，`fsw.Add()` 的错误也不再静默吞掉，`leash doctor` 加了一项 fd 上限检查；顺带修了一个同源问题——`os.Stat` 会跟随符号链接，新建一个指向 `/etc` 之类的符号链接目录会被跟着监控进去，改成 `os.Lstat` 拒绝跟随；`strings.TrimPrefix(rel, "../")` 只剥一层、剥不干净的逃逸路径，改成 `filepath.IsLocal` 直接拒绝记录。② Dashboard 的两个口子——绑定到非 loopback 地址时没有任何提示，加了醒目警告；没有校验 Host 请求头，存在 DNS rebinding 风险（把审计数据在没有登录态的情况下暴露给能连上这台机器的任何人），加了 Host 校验中间件。**v9 设计文档本身三处需要补的诚实度**：Linux 上大量 agent 工具是静态链接的，`LD_PRELOAD` 对静态链接完全无效，这是平台性的覆盖率折扣，不是"基本覆盖"，第 8.1 节矩阵改成按 macOS/Linux 分列；UDP 之前标"✅"有水分，只 hook `connect()` 看不到不经过它的 `sendto`/`sendmsg`，改成"部分覆盖"；新增一种此前完全没考虑过的失效模式——**fail-fatal**：注入库跑在被保护进程自己的地址空间里，它自己的 bug 会直接让宿主进程崩溃，比 fail-open/fail-closed 都糟，第 11 节的验证清单加了这一项。另外把 I0 原型的验证顺序倒过来了：第一天就该用 Codex CLI 本体（node，苹果 hardened runtime 签名）测试注入是否生效，这是整条路径成不成立的 go/no-go，不该先拿 curl 建立虚假信心。
+> - **v9**：找到一条比 Platform Enforcement Track（第 10.2 节原方案）轻量得多的"防绕过"路径——**动态库拦截**（macOS 用 `DYLD_INSERT_LIBRARIES`、Linux 用 `LD_PRELOAD`），在被启动进程的 `connect()` 这类系统库函数入口处直接接管，不管上层用的是 HTTP、SSH 还是任意协议，只要走系统库建连接就跑不掉，而且**不需要 root、不需要苹果/微软的特殊授权**，跟现在注入环境变量、伪装 git shim 是同一个"session 级别、启动时动手脚"的路子，只是这次动的是更底层的系统调用入口而不是环境变量。因此把 Best-effort 和 Enforced 之间拆出一个新的中间档位——**Interposed Mode**（第 3.2 节），详见第 10.2 节的重新拆分。这不是 Enforced Mode 的完全替代（对苹果签名保护的系统程序无效、对存心识破并卸载它的 agent 无效），但足以把"SSH 除 git 外的用途、裸 TCP、UDP"这几个此前完全看不见的出口（第 8.1 节）收进覆盖范围，而且可以留在 Core Track 里做，不需要拆到独立的平台工程线。
 > - **v8**（**v0.3 Core Track 完成**）：Dashboard（`internal/dashboard`，纯 `html/template` 服务端渲染）、Git diff --stat 捕获（`internal/gitshim/hook.go`，利用 pre-push hook 拿到的精确 SHA 对）、Runtime Sensor · File Plane MVP（`internal/filewatch`，fsnotify + 噪音目录排除 + 单 session 5000 条硬上限）、retention（`store.Prune`，默认 30 天，session 启动时自动跑）全部完成并有测试覆盖。过程中一个值得记录的教训：Dashboard 表格 CSS 一开始用 `table-layout: fixed` + 百分比列宽想解决窄列内容溢出问题，结果在窄视口下把 Details 列挤到几乎不可读；改成默认的 `table-layout: auto` + 只在需要的地方（`.fields`）加 `overflow-wrap: anywhere` 才是对的——把 `overflow-wrap` 全局加到所有 `th,td` 上会干扰浏览器自动布局算法对"首选宽度"的计算，反而让内容最多的列被挤得最窄。
 > - **v2**：引入 Observe/Enforce 分级、Session Supervisor 作为架构主干、补上 Runtime Activity Plane、事件模型统一、compliance 明确要求 tamper-evident storage。
 > - **v3**：`Session Supervisor` 降级为一种 Session Provider、PID tree 改用 Attribution Engine、Runtime Sensor 拆成 Process/File Plane、路线图新增 Enforce Preview 里程碑、tamper evidence 拆成 Local/Trusted Evidence 两级、"单二进制"从架构约束降级为分发目标。
@@ -228,7 +229,7 @@ proxy + git shim 本身已经能做 `BLOCK`，不只是记录，所以关键区�
 | 等级 | 承诺 | 实现方式 | 覆盖面 | 适用场景 |
 |---|---|---|---|---|
 | **Best-effort Mode**（v0.1 起） | 拦截到的动作可以阻断，但 agent 与 Leash 同权限运行，agent 可以主动绕过拦截面本身（比如 `unset HTTP_PROXY`） | proxy env 注入 + git shim/hook，用户态运行 | 只有"愿意配合"的 HTTP(S) 流量 + git push | 开发者本机、早期企业试点 |
-| **Interposed Mode**（新增，Core Track 内即可做，见第 10.2 节） | 拦截点从"应用层是否配合"下沉到"进程调用系统库建立连接的那一刻"，agent 自己选不选配合不再重要；但对苹果/系统签名保护的程序无效，对存心识别并卸载拦截模块的 agent 也无效 | 动态库拦截（`DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`），session 级注入，不需要 root、不需要平台特殊授权 | 所有经过系统库 `connect()` 的流量（HTTP/SSH/裸 TCP/UDP 等），不只是愿意配合的 HTTP(S) | 想要"基本绕不过去"但还不需要企业级强制管控的场景 |
+| **Interposed Mode**（新增，Core Track 内即可做，见第 10.2 节） | 拦截点从"应用层是否配合"下沉到"进程调用系统库建立连接的那一刻"，agent 自己选不选配合不再重要；但对苹果/系统签名保护的程序无效，对存心识别并卸载拦截模块的 agent 也无效，**在 Linux 上对静态链接的二进制完全无效**（第 8.1 节），UDP 只算部分覆盖（只 hook `connect()` 看不到未连接的 `sendto`/`sendmsg`） | 动态库拦截（`DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`），session 级注入，不需要 root、不需要平台特殊授权 | 经过系统库 `connect()` 的动态链接流量（HTTP/SSH/裸 TCP 等），macOS 上覆盖面明显好于 Linux（第 8.1 节有平台细分） | 想要"基本绕不过去"但还不需要企业级强制管控的场景，macOS 上尤其值得优先做 |
 | **Enforced Mode**（独立的 Platform Enforcement Track，见第 10.2 节） | agent 无法绕过拦截面：直连出口被 OS 内核层拦截，agent 无法停止特权组件 / 篡改审计日志，对抗性场景下依然成立 | 平台级特权组件（EndpointSecurity/eBPF/WFP），至少先支持一个 OS | 理论上完整覆盖，含 Interposed Mode 覆盖不到的场景 | 企业强制管控 |
 
 ## 4. 产品能力面（Target）
@@ -419,16 +420,20 @@ events
 
 ### 8.1 网络类
 
-| 场景 | Best-effort（proxy env） | Interposed Mode（第 10.2.1 节，Target） |
-|---|---|---|
-| Agent 把源码当 payload POST 到陌生域名（遵循 proxy 配置） | ✅ | ✅ |
-| Agent 把 `.env` 内容塞进 HTTP 请求头 | ✅ | ✅ |
-| `wss://` WebSocket upgrade（客户端遵循 proxy 且 TLS MITM 成功） | ✅ | ✅ |
-| SSH / SCP / SFTP / rsync-over-ssh（git push 以外的用途） | ❌，不走 HTTP_PROXY | ✅，只要走系统库 `connect()` |
-| 裸 TCP socket / UDP | ❌ | ✅，同上 |
-| proxy-unaware 客户端、子进程清空继承的 proxy 环境变量 | ❌ | ✅，不再依赖 env var 配合 |
-| 证书钉扎（pinning）、QUIC(HTTP3) 的应用层内容检查 | ❌ | ❌，Interposed Mode 能看见"连了谁"，看不进 pinning/QUIC 加密内容 |
-| DNS 隧道、系统签名保护的程序（如 macOS 自带 `curl`）、存心卸载拦截模块的 agent | ❌ | ❌，第 10.2.1 节已如实列出的盲区 |
+**Interposed Mode 的覆盖面不是平台无关的**，下表按 macOS / Linux 分别标注，不能笼统写一个"✅"——这是第五轮 review 指出的问题：agent 生态里大量 CLI 工具（尤其 Go/Rust 编译出的单文件分发）在 Linux 上常见静态链接，静态二进制根本不经过 `LD_PRELOAD` 能拦截的动态链接库入口，`LD_PRELOAD` 对它们完全无效；macOS 上这个问题不存在，因为苹果强制几乎所有程序（包括 Go 编译的）都要经过系统库 `libSystem`，`DYLD_INSERT_LIBRARIES` 才能稳定生效。
+
+| 场景 | Best-effort（proxy env） | Interposed Mode · macOS | Interposed Mode · Linux |
+|---|---|---|---|
+| Agent 把源码当 payload POST 到陌生域名（遵循 proxy 配置） | ✅ | ✅ | ✅ |
+| Agent 把 `.env` 内容塞进 HTTP 请求头 | ✅ | ✅ | ✅ |
+| `wss://` WebSocket upgrade（客户端遵循 proxy 且 TLS MITM 成功） | ✅ | ✅ | ✅ |
+| SSH / SCP / SFTP / rsync-over-ssh（git push 以外的用途，动态链接的客户端） | ❌，不走 HTTP_PROXY | ✅，只要走系统库 `connect()` | ✅，前提是动态链接 |
+| 裸 TCP socket（动态链接的客户端） | ❌ | ✅ | ✅，前提是动态链接 |
+| **静态链接的二进制**（Go/Rust 单文件分发在 Linux 上很常见） | ❌ | ✅，苹果强制走 `libSystem`，静态链接也躲不掉 | ❌，`LD_PRELOAD` 对静态链接完全无效，这是平台不对称，不是"基本覆盖" |
+| UDP（`sendto`/`sendmsg`，不一定经过 `connect()`） | ❌ | ⚠️ 部分覆盖，只 hook `connect()` 看不到未连接的 UDP，需要额外 hook `sendto`/`sendmsg` 才能补全 | ⚠️ 同左，且叠加静态链接问题 |
+| proxy-unaware 客户端、子进程清空继承的 proxy 环境变量（动态链接） | ❌ | ✅，不再依赖 env var 配合 | ✅，前提同上 |
+| 证书钉扎（pinning）、QUIC(HTTP3) 的应用层内容检查 | ❌ | ❌，Interposed Mode 能看见"连了谁"，看不进 pinning/QUIC 加密内容 | ❌，同左 |
+| DNS 隧道、系统签名保护的程序（如 macOS 自带 `curl`）、存心卸载拦截模块的 agent | ❌ | ❌，第 10.2.1 节已如实列出的盲区 | ❌，同左 |
 
 ### 8.2 本地/委托外泄类（Runtime Sensor 覆盖，归属置信度可能较低）
 
@@ -495,16 +500,26 @@ v9 之前只有一条"防绕过"路径（Platform Enforcement Track），而且�
 核心机制：`DYLD_INSERT_LIBRARIES`（macOS）/ `LD_PRELOAD`（Linux）在被 `leash run` 启动的进程里注入一个小的原生动态库，接管 `connect()`/`socket()` 这类系统库函数——所有经过系统库发起网络连接的流量都会先过这一层，不管上层协议是 HTTP、SSH 还是别的，也不再依赖 agent 自己"愿不愿意"读 `HTTP_PROXY`。因为只作用于被启动的这一个进程树、不改任何系统级配置，不需要 root、不需要苹果/微软的特殊授权，跟现在往子进程里注入环境变量、往 `PATH` 里塞 git shim 是同一类"session 启动时动手脚"的手法，只是这次伸到了更底层的系统调用入口。
 
 ```text
-I0  可行性原型：macOS 下用 DYLD_INSERT_LIBRARIES 拦截 connect()，验证对 curl/node/python/ssh 等常见工具有效
+I0  可行性原型：macOS 下用 DYLD_INSERT_LIBRARIES 拦截 connect()
+
+    第一天就验证对 Codex CLI 本体（node，hardened runtime 签名）是否生效，
+    不是先拿 curl 练手——这是整条路径的 go/no-go：Codex 是主战场，如果
+    苹果的签名校验机制直接把对 node 的注入挡掉，这条路径对主战场就不
+    成立，早验证早知道，比先在容易验证的工具上建立虚假信心更重要。
+    curl/python/ssh 等其他常见工具作为第二批验证。
+
 I1  正式集成进 leash run：session 启动时生成/复用这个原生库，自动注入
-I2  Linux 对应实现（LD_PRELOAD），处理和 macOS 不同的细节
+I2  Linux 对应实现（LD_PRELOAD），处理和 macOS 不同的细节，包括如何
+    对用户诚实展示"这个工具是不是静态链接、我们到底拦不拦得住"
 ```
 
 已知覆盖不到的场景，需要如实写进第 8.1 节而不是藏起来：
 
 - 苹果对自身签名保护的系统程序（比如 `/bin/bash`、系统自带的 `curl`）做了防注入保护，这类程序不受影响；但 codex、node、python 这些用户自己装的工具不受此限制
-- 极少数不经过系统库、直接和内核系统调用打交道的程序（Linux 上纯静态编译、不链接 glibc 的程序理论上可以这样，macOS 上这种情况少见）
+- **Linux 上对静态链接的二进制完全无效，这不是边缘情况**：agent 生态里大量 CLI 工具（尤其 Go/Rust 编译的单文件分发）在 Linux 上常见静态链接，静态二进制根本不经过 `LD_PRELOAD` 能接管的动态链接入口。macOS 不存在这个问题（苹果强制几乎所有程序走 `libSystem`），但 Linux 是真实的、系统性的覆盖率折扣，第 8.1 节已按平台分别标注，不能用一句笼统的"✅"糊弄过去
+- **UDP 只是部分覆盖**：只 hook `connect()` 看不到不经过 `connect()` 直接调 `sendto`/`sendmsg` 的 UDP 流量，要么把这两个也纳入 hook 面，要么在文档和产品里老实标"部分覆盖"而不是"✅"
 - 存心识别并卸载这个注入模块的 agent——这已经是主动对抗级别的场景，Library Interposition 不是为了对抗这种场景设计的，Enforced Mode（10.2.2）才是
+- **新的失效模式：fail-fatal，不是 fail-open 也不是 fail-closed**。注入的库运行在被保护进程自己的地址空间里，它自己的 bug 造成的后果不再是"这条流量没被审计"，而是**直接让宿主进程崩溃**——这比 fail-open（流量裸奔但至少 agent 还能干活）和 fail-closed（流量被拦但至少能诊断）都糟，用户看到的是"用着用着 agent 直接挂了"，且很难第一时间归因到是 Leash 的注入库导致的。第 0.7 节现有的 fail-safe 分析只覆盖了 `leashd`/proxy/shim 自己出故障的情况，没有覆盖"审计代码把被保护的进程干挂了"这一种。I0 原型验证清单必须专门加一项：故意让注入库内部抛异常/崩溃，观察宿主进程的真实行为，再决定要不要在注入库里加一层"宁可拦截失效也不能让宿主崩"的保护壳
 
 即便有这些盲区，它依然把 Best-effort Mode 完全看不见的"SSH 除 git 外的用途、裸 TCP、UDP"（第 8.1 节）收进了覆盖范围，性价比远高于直接冲 Enforced Mode。
 
@@ -531,4 +546,4 @@ Enforced Mode 的可用性 = Core 版本 × 对应平台 Provider 的成熟度�
 - **Git shim 对 libgit2/go-git 类库调用的盲区**：需要评估这类调用方式在真实 agent harness 里出现的频率。
 - **Enforced Mode 的特权组件分发成本**：EndpointSecurity System Extension / Windows 签名驱动的审批、分发、企业 MDM 部署流程，本身就是不小的工程量和信任成本，在启动 E1/E2/E3 之前需要专门评估。
 - **委托外泄的归因上限**：browser automation、容器内网络等场景下，delegated-operation correlation 能做到多可靠，需要原型验证后再确定纳入哪个版本，且需要对用户诚实展示"低置信度"而不是给出确定性归因的假象。
-- **Library Interposition（第 10.2.1 节）的真实覆盖率，写进文档前必须先用原型验证**：目前只是技术洞察，还没做过 I0 可行性原型。至少要在 macOS 上实测：① `DYLD_INSERT_LIBRARIES` 对 codex/node/python/ssh/curl 等真实工具是否真的生效（而不是理论上应该生效）；② Go 编译的二进制在 macOS 上是否确实稳定走系统库 `connect()`（这是这条路径成立的前提假设，需要用真实 Go 程序验证，不能只凭对平台 ABI 的一般认知就下结论）；③ macOS 的完整性保护机制在哪些具体路径/场景下会拒绝这次注入，把"哪些工具会生效、哪些不会"列成一张实测清单，而不是笼统一句"用户自己装的工具不受限制"。
+- **Library Interposition（第 10.2.1 节）的真实覆盖率，写进文档前必须先用原型验证**：目前只是技术洞察，还没做过 I0 可行性原型。第 10.2.1 节已经列了具体验证清单（**优先验证对 Codex CLI/node 本体是否生效，而不是先拿 curl 建立虚假信心**、Linux 静态链接的覆盖率折扣、UDP 只是部分覆盖、以及新增的 fail-fatal 失效模式——注入库自身崩溃会直接拖垮宿主进程，不是 fail-open 也不是 fail-closed），这里不重复，只强调一点：**这些都是第五轮安全 review 找出来的具体缺口，不是泛泛的"要测试"，原型必须逐条给出实测结论，不能只验证顺利的那条路径就下结论"方案可行"。**
