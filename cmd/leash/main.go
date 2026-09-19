@@ -32,12 +32,17 @@ func main() {
 		os.Exit(gitshim.RunPrePushHook(os.Args[1:], os.Stdin))
 	}
 
-	if len(os.Args) >= 2 && os.Args[1] == "doctor" {
-		os.Exit(runDoctor())
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "doctor":
+			os.Exit(runDoctor())
+		case "dashboard":
+			os.Exit(runDashboard(os.Args[2:]))
+		}
 	}
 
 	if len(os.Args) < 2 || os.Args[1] != "run" {
-		fmt.Fprintln(os.Stderr, "usage: leash run -- <command> [args...]")
+		fmt.Fprintln(os.Stderr, "usage:\n  leash run -- <command> [args...]\n  leash doctor\n  leash dashboard [addr]")
 		os.Exit(2)
 	}
 

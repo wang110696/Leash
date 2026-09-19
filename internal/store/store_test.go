@@ -2,6 +2,7 @@ package store
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -167,4 +168,72 @@ func openTestStore2(t *testing.T, path string) *Store {
 	}
 	t.Cleanup(func() { st.Close() })
 	return st
+}
+
+func TestListSessions(t *testing.T) {
+	st := openTestStore(t)
+
+	if err := st.InsertEvent("sess-a", "network", "info", Allow, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertEvent("sess-a", "network", "high", Block, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertEvent("sess-b", "git_push", "info", Allow, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, err := st.ListSessions()
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("ListSessions() returned %d sessions; want 2", len(sessions))
+	}
+
+	byID := map[string]SessionInfo{}
+	for _, s := range sessions {
+		byID[s.SessionID] = s
+	}
+	a, ok := byID["sess-a"]
+	if !ok {
+		t.Fatal("sess-a missing from ListSessions()")
+	}
+	if a.EventCount != 2 || a.Allow != 1 || a.Block != 1 {
+		t.Fatalf("sess-a summary = %+v; want EventCount:2 Allow:1 Block:1", a)
+	}
+	if a.StartedAt.IsZero() || a.EndedAt.IsZero() {
+		t.Fatalf("sess-a StartedAt/EndedAt not populated: %+v", a)
+	}
+}
+
+func TestListEvents(t *testing.T) {
+	st := openTestStore(t)
+
+	if err := st.InsertEvent("sess-a", "network", "info", Allow, map[string]any{"host": "example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertEvent("sess-a", "git_push", "high", Block, map[string]any{"remote": "evil.example/x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertEvent("sess-b", "network", "info", Allow, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := st.ListEvents("sess-a")
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("ListEvents(sess-a) returned %d events; want 2 (sess-b's event must not leak in)", len(events))
+	}
+	if events[0].Kind != "network" || events[1].Kind != "git_push" {
+		t.Fatalf("ListEvents order = [%s, %s]; want chronological [network, git_push]", events[0].Kind, events[1].Kind)
+	}
+	if events[1].Decision != Block {
+		t.Fatalf("events[1].Decision = %v; want Block", events[1].Decision)
+	}
+	if !strings.Contains(events[1].PayloadJSON, "evil.example/x") {
+		t.Fatalf("events[1].PayloadJSON = %q; want it to contain the remote", events[1].PayloadJSON)
+	}
 }

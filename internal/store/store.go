@@ -126,6 +126,88 @@ func (s *Store) InsertEvent(sessionID, kind, severity string, decision Decision,
 	return err
 }
 
+// Event is one row of the events table, as read back for display
+// (ARCHITECTURE.md 10.1 v0.3 "flight recorder" dashboard).
+type Event struct {
+	ID          int64
+	SessionID   string
+	Ts          time.Time
+	Kind        string
+	Severity    string
+	Decision    Decision
+	PayloadJSON string
+}
+
+// SessionInfo summarizes one session for the dashboard's session list.
+type SessionInfo struct {
+	SessionID  string
+	StartedAt  time.Time
+	EndedAt    time.Time
+	EventCount int
+	Allow      int
+	Warn       int
+	Block      int
+}
+
+// ListSessions returns every session that has at least one event, most
+// recently active first.
+func (s *Store) ListSessions() ([]SessionInfo, error) {
+	rows, err := s.db.Query(`
+		SELECT session_id, MIN(ts), MAX(ts), COUNT(*),
+		       SUM(CASE WHEN decision = 'allow' THEN 1 ELSE 0 END),
+		       SUM(CASE WHEN decision = 'warn'  THEN 1 ELSE 0 END),
+		       SUM(CASE WHEN decision = 'block' THEN 1 ELSE 0 END)
+		FROM events
+		GROUP BY session_id
+		ORDER BY MAX(ts) DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []SessionInfo
+	for rows.Next() {
+		var info SessionInfo
+		var startMs, endMs int64
+		if err := rows.Scan(&info.SessionID, &startMs, &endMs, &info.EventCount,
+			&info.Allow, &info.Warn, &info.Block); err != nil {
+			return nil, err
+		}
+		info.StartedAt = time.UnixMilli(startMs)
+		info.EndedAt = time.UnixMilli(endMs)
+		out = append(out, info)
+	}
+	return out, rows.Err()
+}
+
+// ListEvents returns every event for a session in chronological order
+// (the session's "replay" — ARCHITECTURE.md 10.1 v0.3).
+func (s *Store) ListEvents(sessionID string) ([]Event, error) {
+	rows, err := s.db.Query(
+		`SELECT id, session_id, ts, kind, severity, decision, payload_json
+		 FROM events WHERE session_id = ? ORDER BY ts, id`,
+		sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Event
+	for rows.Next() {
+		var e Event
+		var tsMs int64
+		var decision string
+		if err := rows.Scan(&e.ID, &e.SessionID, &tsMs, &e.Kind, &e.Severity, &decision, &e.PayloadJSON); err != nil {
+			return nil, err
+		}
+		e.Ts = time.UnixMilli(tsMs)
+		e.Decision = Decision(decision)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // Prune deletes events older than olderThan and returns how many rows were
 // removed (ARCHITECTURE.md 5.1/10.1 "retention"). It runs an unconditional
 // VACUUM afterward so disk usage actually shrinks — SQLite doesn't release
