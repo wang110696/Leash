@@ -4,7 +4,8 @@
 > 知道 agent 运行了什么、改了什么、提交了什么、往哪里发了什么，并且在高风险动作发生前有能力做 policy decision。
 
 > **修订历史**
-> - **v8**（本版本，**v0.3 Core Track 完成**）：Dashboard（`internal/dashboard`，纯 `html/template` 服务端渲染）、Git diff --stat 捕获（`internal/gitshim/hook.go`，利用 pre-push hook 拿到的精确 SHA 对）、Runtime Sensor · File Plane MVP（`internal/filewatch`，fsnotify + 噪音目录排除 + 单 session 5000 条硬上限）、retention（`store.Prune`，默认 30 天，session 启动时自动跑）全部完成并有测试覆盖。过程中一个值得记录的教训：Dashboard 表格 CSS 一开始用 `table-layout: fixed` + 百分比列宽想解决窄列内容溢出问题，结果在窄视口下把 Details 列挤到几乎不可读；改成默认的 `table-layout: auto` + 只在需要的地方（`.fields`）加 `overflow-wrap: anywhere` 才是对的——把 `overflow-wrap` 全局加到所有 `th,td` 上会干扰浏览器自动布局算法对"首选宽度"的计算，反而让内容最多的列被挤得最窄。
+> - **v9**（本版本）：找到一条比 Platform Enforcement Track（第 10.2 节原方案）轻量得多的"防绕过"路径——**动态库拦截**（macOS 用 `DYLD_INSERT_LIBRARIES`、Linux 用 `LD_PRELOAD`），在被启动进程的 `connect()` 这类系统库函数入口处直接接管，不管上层用的是 HTTP、SSH 还是任意协议，只要走系统库建连接就跑不掉，而且**不需要 root、不需要苹果/微软的特殊授权**，跟现在注入环境变量、伪装 git shim 是同一个"session 级别、启动时动手脚"的路子，只是这次动的是更底层的系统调用入口而不是环境变量。因此把 Best-effort 和 Enforced 之间拆出一个新的中间档位——**Interposed Mode**（第 3.2 节），详见第 10.2 节的重新拆分。这不是 Enforced Mode 的完全替代（对苹果签名保护的系统程序无效、对存心识破并卸载它的 agent 无效），但足以把"SSH 除 git 外的用途、裸 TCP、UDP"这几个此前完全看不见的出口（第 8.1 节）收进覆盖范围，而且可以留在 Core Track 里做，不需要拆到独立的平台工程线。
+> - **v8**（**v0.3 Core Track 完成**）：Dashboard（`internal/dashboard`，纯 `html/template` 服务端渲染）、Git diff --stat 捕获（`internal/gitshim/hook.go`，利用 pre-push hook 拿到的精确 SHA 对）、Runtime Sensor · File Plane MVP（`internal/filewatch`，fsnotify + 噪音目录排除 + 单 session 5000 条硬上限）、retention（`store.Prune`，默认 30 天，session 启动时自动跑）全部完成并有测试覆盖。过程中一个值得记录的教训：Dashboard 表格 CSS 一开始用 `table-layout: fixed` + 百分比列宽想解决窄列内容溢出问题，结果在窄视口下把 Details 列挤到几乎不可读；改成默认的 `table-layout: auto` + 只在需要的地方（`.fields`）加 `overflow-wrap: anywhere` 才是对的——把 `overflow-wrap` 全局加到所有 `th,td` 上会干扰浏览器自动布局算法对"首选宽度"的计算，反而让内容最多的列被挤得最窄。
 > - **v2**：引入 Observe/Enforce 分级、Session Supervisor 作为架构主干、补上 Runtime Activity Plane、事件模型统一、compliance 明确要求 tamper-evident storage。
 > - **v3**：`Session Supervisor` 降级为一种 Session Provider、PID tree 改用 Attribution Engine、Runtime Sensor 拆成 Process/File Plane、路线图新增 Enforce Preview 里程碑、tamper evidence 拆成 Local/Trusted Evidence 两级、"单二进制"从架构约束降级为分发目标。
 > - **v4**：第三轮 review 的结论是 v3 已经对 v0.1 产生了明显的过度设计。本版本把文档拆成 v0.1 MVP（第 0 节，只有 6 个概念）和 Target Architecture（第 1 节起，定义演进边界，不是包结构），并修正了 per-session proxy port、Attribution Engine confidence 建模、Enforced Mode 独立成 Platform Enforcement Track 这三处设计。
@@ -220,14 +221,15 @@ HTTP(S) 出口代理的原理是 agent 进程读取 `HTTP_PROXY` / `HTTPS_PROXY`
 
 结论：两个平面解决的是**不同层次的信息**，不能互相替代，必须并存：**Egress Plane**（出口平面）和 **SCM Semantic Plane**（版本控制语义平面）。
 
-### 3.2 Best-effort 与 Enforced：必须现在就承认的信任边界
+### 3.2 Best-effort / Interposed / Enforced：必须现在就承认的信任边界
 
-proxy + git shim 本身已经能做 `BLOCK`，不只是记录，所以关键区别不是"观察 vs 拦截"，而是"**拦截面能不能被绕过**"：
+proxy + git shim 本身已经能做 `BLOCK`，不只是记录，所以关键区别不是"观察 vs 拦截"，而是"**拦截面能不能被绕过、覆盖面有多宽**"。v9 拆出三档，不再是简单的二选一：
 
-| 等级 | 承诺 | 实现方式 | 适用场景 |
-|---|---|---|---|
-| **Best-effort Mode**（v0.1 起） | 拦截到的动作可以阻断，但 agent 与 Leash 同权限运行，agent 可以主动绕过拦截面本身 | proxy env 注入 + git shim/hook，用户态运行 | 开发者本机、早期企业试点 |
-| **Enforced Mode**（独立的 Platform Enforcement Track，见第 10.2 节） | agent 无法绕过拦截面：直连出口被 OS 层拦截，agent 无法停止特权组件 / 篡改审计日志 | 平台级特权组件，至少先支持一个 OS | 企业强制管控 |
+| 等级 | 承诺 | 实现方式 | 覆盖面 | 适用场景 |
+|---|---|---|---|---|
+| **Best-effort Mode**（v0.1 起） | 拦截到的动作可以阻断，但 agent 与 Leash 同权限运行，agent 可以主动绕过拦截面本身（比如 `unset HTTP_PROXY`） | proxy env 注入 + git shim/hook，用户态运行 | 只有"愿意配合"的 HTTP(S) 流量 + git push | 开发者本机、早期企业试点 |
+| **Interposed Mode**（新增，Core Track 内即可做，见第 10.2 节） | 拦截点从"应用层是否配合"下沉到"进程调用系统库建立连接的那一刻"，agent 自己选不选配合不再重要；但对苹果/系统签名保护的程序无效，对存心识别并卸载拦截模块的 agent 也无效 | 动态库拦截（`DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`），session 级注入，不需要 root、不需要平台特殊授权 | 所有经过系统库 `connect()` 的流量（HTTP/SSH/裸 TCP/UDP 等），不只是愿意配合的 HTTP(S) | 想要"基本绕不过去"但还不需要企业级强制管控的场景 |
+| **Enforced Mode**（独立的 Platform Enforcement Track，见第 10.2 节） | agent 无法绕过拦截面：直连出口被 OS 内核层拦截，agent 无法停止特权组件 / 篡改审计日志，对抗性场景下依然成立 | 平台级特权组件（EndpointSecurity/eBPF/WFP），至少先支持一个 OS | 理论上完整覆盖，含 Interposed Mode 覆盖不到的场景 | 企业强制管控 |
 
 ## 4. 产品能力面（Target）
 
@@ -403,7 +405,7 @@ events
 
 ### 7.1 Leash Core：单二进制是分发目标，不是架构约束
 
-`leashd` 的控制面（CLI、daemon、事件存储、policy 引擎、Dashboard）可以永远是单二进制，但要可靠拿到进程执行、文件 I/O，甚至做到"agent 无法绕过"的 Enforced Mode，各平台都需要 OS 原生的特权组件——这些不可能是裸 Go 二进制，详见第 10.2 节 Platform Enforcement Track。v0.1-v0.3（Egress + Git + Process/File Plane 的用户态实现）不需要特权组件，可以做到"下载一个 binary 就运行"。
+`leashd` 的控制面（CLI、daemon、事件存储、policy 引擎、Dashboard）可以永远是单二进制。真正需要 OS 原生特权组件（System Extension/eBPF+capabilities/kernel driver）、不可能是裸 Go 二进制的，是第 10.2.2 节的 Platform Enforcement Track。v0.1-v0.3（Egress + Git + Process/File Plane 的用户态实现）不需要特权组件；第 10.2.1 节新加的 Library Interposition（Interposed Mode）也不需要——它只是随 `leash run` 一起分发一个小的原生动态库，session 启动时注入到被启动的进程里，不需要 root、不需要额外的系统安装步骤，"下载一个 binary 就运行"这条分发承诺在 Interposed Mode 也成立。
 
 ### 7.2 其余选型
 
@@ -417,13 +419,16 @@ events
 
 ### 8.1 网络类
 
-| 场景 | 是否被 Egress Sensor 覆盖 |
-|---|---|
-| Agent 把源码当 payload POST 到陌生域名（遵循 proxy 配置） | ✅ |
-| Agent 把 `.env` 内容塞进 HTTP 请求头 | ✅ |
-| `wss://` WebSocket upgrade（客户端遵循 proxy 且 TLS MITM 成功） | ✅ |
-| SSH / SCP / SFTP / rsync-over-ssh / 裸 TCP socket / UDP / QUIC(HTTP3) / DNS 隧道 | ❌，不走 HTTP_PROXY |
-| proxy-unaware 客户端、证书钉扎、子进程清空继承的 proxy 环境变量 | ❌ |
+| 场景 | Best-effort（proxy env） | Interposed Mode（第 10.2.1 节，Target） |
+|---|---|---|
+| Agent 把源码当 payload POST 到陌生域名（遵循 proxy 配置） | ✅ | ✅ |
+| Agent 把 `.env` 内容塞进 HTTP 请求头 | ✅ | ✅ |
+| `wss://` WebSocket upgrade（客户端遵循 proxy 且 TLS MITM 成功） | ✅ | ✅ |
+| SSH / SCP / SFTP / rsync-over-ssh（git push 以外的用途） | ❌，不走 HTTP_PROXY | ✅，只要走系统库 `connect()` |
+| 裸 TCP socket / UDP | ❌ | ✅，同上 |
+| proxy-unaware 客户端、子进程清空继承的 proxy 环境变量 | ❌ | ✅，不再依赖 env var 配合 |
+| 证书钉扎（pinning）、QUIC(HTTP3) 的应用层内容检查 | ❌ | ❌，Interposed Mode 能看见"连了谁"，看不进 pinning/QUIC 加密内容 |
+| DNS 隧道、系统签名保护的程序（如 macOS 自带 `curl`）、存心卸载拦截模块的 agent | ❌ | ❌，第 10.2.1 节已如实列出的盲区 |
 
 ### 8.2 本地/委托外泄类（Runtime Sensor 覆盖，归属置信度可能较低）
 
@@ -481,9 +486,31 @@ Trusted Evidence（企业可选）
 5. **v0.5 — Enterprise Evidence（仍是 Core，纯软件）**：Local Integrity 默认具备，Trusted Evidence 作为企业可选项，policy snapshot，HTML/PDF 合规报告导出。
 6. **v0.6 — Supply Chain**：skill/plugin/MCP 静态扫描，明确排最后，因为不是核心差异化能力。
 
-### 10.2 Platform Enforcement Track（独立工作流，不用 Core 版本号背书）
+### 10.2 拦截覆盖面的两条路，不是一条
 
-**修正**：此前把 Enforced Mode 标成 Core 的 `v0.4`，会严重低估它的工程性质——macOS 需要 Endpoint Security entitlement + System Extension + app 签名/公证/升级生命周期；Windows 需要 kernel-mode minifilter driver + EV 签名证书 + Hardware Dev Center 审批；这些是独立的平台安全工程量级，不是"下一个 feature"。因此单独编号，不与 Core Track 的版本号绑定：
+v9 之前只有一条"防绕过"路径（Platform Enforcement Track），而且被正确地判定为工程量级太重、不该和 Core Track 的版本号绑在一起。现在拆成两条独立的路，第一条比原来设想的轻得多：
+
+#### 10.2.1 Library Interposition Track（轻量，可以留在 Core Track 里）
+
+核心机制：`DYLD_INSERT_LIBRARIES`（macOS）/ `LD_PRELOAD`（Linux）在被 `leash run` 启动的进程里注入一个小的原生动态库，接管 `connect()`/`socket()` 这类系统库函数——所有经过系统库发起网络连接的流量都会先过这一层，不管上层协议是 HTTP、SSH 还是别的，也不再依赖 agent 自己"愿不愿意"读 `HTTP_PROXY`。因为只作用于被启动的这一个进程树、不改任何系统级配置，不需要 root、不需要苹果/微软的特殊授权，跟现在往子进程里注入环境变量、往 `PATH` 里塞 git shim 是同一类"session 启动时动手脚"的手法，只是这次伸到了更底层的系统调用入口。
+
+```text
+I0  可行性原型：macOS 下用 DYLD_INSERT_LIBRARIES 拦截 connect()，验证对 curl/node/python/ssh 等常见工具有效
+I1  正式集成进 leash run：session 启动时生成/复用这个原生库，自动注入
+I2  Linux 对应实现（LD_PRELOAD），处理和 macOS 不同的细节
+```
+
+已知覆盖不到的场景，需要如实写进第 8.1 节而不是藏起来：
+
+- 苹果对自身签名保护的系统程序（比如 `/bin/bash`、系统自带的 `curl`）做了防注入保护，这类程序不受影响；但 codex、node、python 这些用户自己装的工具不受此限制
+- 极少数不经过系统库、直接和内核系统调用打交道的程序（Linux 上纯静态编译、不链接 glibc 的程序理论上可以这样，macOS 上这种情况少见）
+- 存心识别并卸载这个注入模块的 agent——这已经是主动对抗级别的场景，Library Interposition 不是为了对抗这种场景设计的，Enforced Mode（10.2.2）才是
+
+即便有这些盲区，它依然把 Best-effort Mode 完全看不见的"SSH 除 git 外的用途、裸 TCP、UDP"（第 8.1 节）收进了覆盖范围，性价比远高于直接冲 Enforced Mode。
+
+#### 10.2.2 Platform Enforcement Track（重量级，独立工作流，不用 Core 版本号背书）
+
+真正的"agent 无法绕过、对抗性场景下依然成立"的 Enforced Mode，还是要靠操作系统内核层的强制能力——macOS 需要 Endpoint Security entitlement + System Extension + app 签名/公证/升级生命周期；Windows 需要 kernel-mode minifilter driver + EV 签名证书 + Hardware Dev Center 审批。这些是独立的平台安全工程量级，不是"下一个 feature"，单独编号，不与 Core Track 的版本号绑定：
 
 ```text
 E0  可行性原型（建议从 macOS EndpointSecurity 开始）
@@ -494,6 +521,8 @@ E3  Windows provider（minifilter，kernel driver 签名）
 
 Enforced Mode 的可用性 = Core 版本 × 对应平台 Provider 的成熟度（例如 "Leash Core 0.8 + macOS Enforcer E1 → macOS Enforced Preview"），而不是简单的 Core 版本号推进。一个强的个人开发者或 3-5 人团队完全可能做出其中一个平台的 provider，但这需要平台 entitlement/signing/deployment 相关的专门能力，不是 Core 功能迭代的自然延伸，路线图上必须诚实地把这件事和 Core Track 分开标注。
 
+**两条路的关系**：不是二选一，是先后关系。Library Interposition（10.2.1）门槛低、能在 Core Track 里较快做出来，先把 Interposed Mode 立起来，把 Best-effort 和真正的 Enforced 之间的巨大空当填上一部分；Platform Enforcement Track（10.2.2）依然是终局目标，但不再是唯一能讲的"防绕过"故事，可以按自己的节奏推进而不阻塞产品往前走。
+
 ## 11. 仍然开放、需要持续验证的风险
 
 - **v0.1 的 detection 规则集是否够用**：先用少量高置信度规则（已知 token 前缀、`.env` 路径上下文）跑通 demo，不追求覆盖率，避免第一版就陷入规则调优的无底洞。
@@ -502,3 +531,4 @@ Enforced Mode 的可用性 = Core 版本 × 对应平台 Provider 的成熟度�
 - **Git shim 对 libgit2/go-git 类库调用的盲区**：需要评估这类调用方式在真实 agent harness 里出现的频率。
 - **Enforced Mode 的特权组件分发成本**：EndpointSecurity System Extension / Windows 签名驱动的审批、分发、企业 MDM 部署流程，本身就是不小的工程量和信任成本，在启动 E1/E2/E3 之前需要专门评估。
 - **委托外泄的归因上限**：browser automation、容器内网络等场景下，delegated-operation correlation 能做到多可靠，需要原型验证后再确定纳入哪个版本，且需要对用户诚实展示"低置信度"而不是给出确定性归因的假象。
+- **Library Interposition（第 10.2.1 节）的真实覆盖率，写进文档前必须先用原型验证**：目前只是技术洞察，还没做过 I0 可行性原型。至少要在 macOS 上实测：① `DYLD_INSERT_LIBRARIES` 对 codex/node/python/ssh/curl 等真实工具是否真的生效（而不是理论上应该生效）；② Go 编译的二进制在 macOS 上是否确实稳定走系统库 `connect()`（这是这条路径成立的前提假设，需要用真实 Go 程序验证，不能只凭对平台 ABI 的一般认知就下结论）；③ macOS 的完整性保护机制在哪些具体路径/场景下会拒绝这次注入，把"哪些工具会生效、哪些不会"列成一张实测清单，而不是笼统一句"用户自己装的工具不受限制"。
