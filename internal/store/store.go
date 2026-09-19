@@ -63,16 +63,17 @@ const (
 )
 
 // Summary reports how many events of each decision were recorded for a
-// session — used for the end-of-session CLI banner. ProcessesObserved and
-// DiffStatsRecorded are counted separately from Allow: process_exec
-// (Runtime Sensor · Process Plane, v0.2) and git_diff_stat (v0.3) events
-// are record-only informational enrichment, not allow/block decisions
-// about a security-sensitive action, and mixing them into Allow would make
-// that count misleading.
+// session — used for the end-of-session CLI banner. ProcessesObserved,
+// DiffStatsRecorded and FileMutations are counted separately from Allow:
+// process_exec (v0.2), git_diff_stat and file_mutation (v0.3) events are
+// record-only informational enrichment, not allow/block decisions about a
+// security-sensitive action, and mixing them into Allow would make that
+// count misleading.
 type Summary struct {
 	Allow, Warn, Block int
 	ProcessesObserved  int
 	DiffStatsRecorded  int
+	FileMutations      int
 }
 
 func (s *Store) Summary(sessionID string) (Summary, error) {
@@ -97,6 +98,9 @@ func (s *Store) Summary(sessionID string) (Summary, error) {
 			continue
 		case "git_diff_stat":
 			sum.DiffStatsRecorded += n
+			continue
+		case "file_mutation":
+			sum.FileMutations += n
 			continue
 		}
 		switch Decision(decision) {

@@ -116,12 +116,12 @@ th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #e0
 th { color: #666; font-size: 0.85rem; text-transform: uppercase; }
 a { color: #0060df; text-decoration: none; }
 a:hover { text-decoration: underline; }
-.badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }
+.badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.8rem; font-weight: 600; white-space: nowrap; }
 .badge-allow { background: #e3f9e5; color: #1b7a2c; }
 .badge-warn  { background: #fff4d6; color: #8a6100; }
 .badge-block { background: #fde3e3; color: #a11212; }
-.kind { font-family: ui-monospace, monospace; font-size: 0.85rem; color: #444; }
-.fields { font-family: ui-monospace, monospace; font-size: 0.85rem; color: #333; }
+.kind { font-family: ui-monospace, monospace; font-size: 0.85rem; color: #444; white-space: nowrap; }
+.fields { font-family: ui-monospace, monospace; font-size: 0.85rem; color: #333; overflow-wrap: anywhere; }
 .fields div { margin: 0.15rem 0; }
 .fields pre { background: #fff; border: 1px solid #e0e0e0; border-radius: 4px; padding: 0.5rem; overflow-x: auto; margin: 0.25rem 0; }
 .ts { color: #888; font-size: 0.85rem; white-space: nowrap; }

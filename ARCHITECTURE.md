@@ -4,6 +4,7 @@
 > 知道 agent 运行了什么、改了什么、提交了什么、往哪里发了什么，并且在高风险动作发生前有能力做 policy decision。
 
 > **修订历史**
+> - **v8**（本版本，**v0.3 Core Track 完成**）：Dashboard（`internal/dashboard`，纯 `html/template` 服务端渲染）、Git diff --stat 捕获（`internal/gitshim/hook.go`，利用 pre-push hook 拿到的精确 SHA 对）、Runtime Sensor · File Plane MVP（`internal/filewatch`，fsnotify + 噪音目录排除 + 单 session 5000 条硬上限）、retention（`store.Prune`，默认 30 天，session 启动时自动跑）全部完成并有测试覆盖。过程中一个值得记录的教训：Dashboard 表格 CSS 一开始用 `table-layout: fixed` + 百分比列宽想解决窄列内容溢出问题，结果在窄视口下把 Details 列挤到几乎不可读；改成默认的 `table-layout: auto` + 只在需要的地方（`.fields`）加 `overflow-wrap: anywhere` 才是对的——把 `overflow-wrap` 全局加到所有 `th,td` 上会干扰浏览器自动布局算法对"首选宽度"的计算，反而让内容最多的列被挤得最窄。
 > - **v2**：引入 Observe/Enforce 分级、Session Supervisor 作为架构主干、补上 Runtime Activity Plane、事件模型统一、compliance 明确要求 tamper-evident storage。
 > - **v3**：`Session Supervisor` 降级为一种 Session Provider、PID tree 改用 Attribution Engine、Runtime Sensor 拆成 Process/File Plane、路线图新增 Enforce Preview 里程碑、tamper evidence 拆成 Local/Trusted Evidence 两级、"单二进制"从架构约束降级为分发目标。
 > - **v4**：第三轮 review 的结论是 v3 已经对 v0.1 产生了明显的过度设计。本版本把文档拆成 v0.1 MVP（第 0 节，只有 6 个概念）和 Target Architecture（第 1 节起，定义演进边界，不是包结构），并修正了 per-session proxy port、Attribution Engine confidence 建模、Enforced Mode 独立成 Platform Enforcement Track 这三处设计。
@@ -470,7 +471,12 @@ Trusted Evidence（企业可选）
    - ✅ secret 检测规则库扩充（新增 GitLab/Slack/Stripe/Google/npm token、PEM 私钥头）
    - ✅ Runtime Sensor · Process Plane（轮询 `ps` + 父子 PID 谱系，record-only）—— `internal/procwatch`
    - ✅ **Attribution Engine 第一版**（ancestry-based，第 5.2 节证据模型的 macOS 用户态子集——没有 cgroup/audit token 这类内核级证据，只有进程谱系）
-3. **v0.3 — Flight recorder**：Dashboard 时间线、Git diff viewer、session 回放、Runtime Sensor · File Plane MVP、retention。
+3. **v0.3 — Flight recorder**（**已完成**）：
+   - ✅ **Dashboard**（`leash dashboard`，`internal/dashboard`）：session 列表 + 每个 session 的时间线，纯 `html/template` 服务端渲染，无 JS/CDN 依赖，只读、只绑 127.0.0.1
+   - ✅ **Git diff viewer**：pre-push hook 在放行时用它拿到的精确 local/remote SHA 对捕获 `git diff --stat`（只有文件名和增删行数，不含代码内容），存成 `git_diff_stat` 事件，Dashboard 里以 `<pre>` 展示
+   - ✅ **Session 回放**：每个 session 的事件按时间线顺序展示，就是 Dashboard 的核心视图
+   - ✅ **Runtime Sensor · File Plane MVP**（`internal/filewatch`）：用 fsnotify（macOS 上是 kqueue，无需 cgo）监听 session 工作目录，record-only，排除 `.git`/`node_modules`/`vendor` 等噪音目录，单 session 硬上限 5000 条防止暴增
+   - ✅ **Retention**：`policy.yaml` 的 `retention.days`（默认 30），每个 session 启动时自动 prune 过期事件并 VACUUM
 4. **v0.4 — Core 成熟化**：detection 准确率、性能、multi-session、Attach Provider / Harness Adapter（第一次真正需要 `SessionProvider` 抽象的时候）。
 5. **v0.5 — Enterprise Evidence（仍是 Core，纯软件）**：Local Integrity 默认具备，Trusted Evidence 作为企业可选项，policy snapshot，HTML/PDF 合规报告导出。
 6. **v0.6 — Supply Chain**：skill/plugin/MCP 静态扫描，明确排最后，因为不是核心差异化能力。

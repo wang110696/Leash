@@ -16,6 +16,7 @@ import (
 
 	"github.com/wang110696/Leash/internal"
 	"github.com/wang110696/Leash/internal/ca"
+	"github.com/wang110696/Leash/internal/filewatch"
 	"github.com/wang110696/Leash/internal/gitremote"
 	"github.com/wang110696/Leash/internal/gitshim"
 	"github.com/wang110696/Leash/internal/policy"
@@ -194,13 +195,25 @@ func runSession(command []string) (int, error) {
 	observer := procwatch.New(sessionID, cmd.Process.Pid, st)
 	go observer.Run(obsCtx)
 
+	// Runtime Sensor · File Plane MVP (v0.3, ARCHITECTURE.md 10.1):
+	// best-effort, record-only file mutation tracking under cwd. A setup
+	// failure (e.g. too many files to watch, hitting an OS fd/watch limit)
+	// is logged and otherwise ignored — like Process Plane, this is
+	// enrichment, not something the session depends on.
+	if fw, err := filewatch.New(sessionID, cwd, st); err != nil {
+		fmt.Fprintf(os.Stderr, "leash: warning: file watch setup failed: %v\n", err)
+	} else {
+		go fw.Run(obsCtx)
+		defer fw.Close()
+	}
+
 	runErr := cmd.Wait()
 	stopObserving()
 
 	summary, sumErr := st.Summary(sessionID)
 	if sumErr == nil {
-		fmt.Fprintf(os.Stderr, "leash: session %s ended — allow=%d warn=%d block=%d, processes observed=%d, diffs recorded=%d\n",
-			sessionID, summary.Allow, summary.Warn, summary.Block, summary.ProcessesObserved, summary.DiffStatsRecorded)
+		fmt.Fprintf(os.Stderr, "leash: session %s ended — allow=%d warn=%d block=%d, processes observed=%d, diffs recorded=%d, file mutations=%d\n",
+			sessionID, summary.Allow, summary.Warn, summary.Block, summary.ProcessesObserved, summary.DiffStatsRecorded, summary.FileMutations)
 	}
 
 	if runErr != nil {
